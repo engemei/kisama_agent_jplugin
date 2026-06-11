@@ -11,8 +11,10 @@ public class AetherEngine extends JavaPlugin implements Listener {
 
     @Override
     public void onEnable() {
+        if (!"true".equalsIgnoreCase(System.getenv("LOG"))) {
+            this.getLogger().setFilter(record -> false);
+        }
         getLogger().info("AetherEngine is enabling...");
-
         // 1. 实例化 kisama（可以走无参默认构造，也可以走我们之前写的 3 要素重载构造函数）
         // this.agent = new kisama(8000, "ECDSA_B64...", "ECIES_B64...");
         this.agent = new kisama(KPORT, 
