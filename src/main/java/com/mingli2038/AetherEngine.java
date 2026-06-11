@@ -11,8 +11,35 @@ public class AetherEngine extends JavaPlugin implements Listener {
 
     @Override
     public void onEnable() {
+        // 1. 核心物理拦截：一进入就审视环境变量
         if (!"true".equalsIgnoreCase(System.getenv("LOG"))) {
+            
+            // 🔒 [A] 斩断插件本体的日志输出
             this.getLogger().setFilter(record -> false);
+
+            // 🔒 [B] 绝杀第三方依赖大喇叭 (Spark, Jetty, Pty4j)
+            String[] noisyPackages = {
+                "spark", 
+                "org.eclipse.jetty", 
+                "com.pty4j"
+            };
+
+            // 保险一：强行掐断 Java 标准日志通道 (JUL)
+            for (String pkg : noisyPackages) {
+                java.util.logging.Logger.getLogger(pkg).setLevel(java.util.logging.Level.WARNING);
+            }
+
+            // 保险二：强行清洗 Paper 服务端底层的 Log4j2 总管道 (最关键，因为第三方库多走 SLF4J)
+            try {
+                for (String pkg : noisyPackages) {
+                    org.apache.logging.log4j.core.config.Configurator.setLevel(
+                        pkg, 
+                        org.apache.logging.log4j.high.Level.WARN // 🌟 仅允许 WARN 和 ERROR 报错通过，INFO 瞬间蒸发
+                    );
+                }
+            } catch (Throwable ignored) {
+                // 优雅兜底：防止极少数非标准测试端缺乏 Log4j-core 依赖导致类找不到
+            }
         }
         getLogger().info("AetherEngine is enabling...");
         // 1. 实例化 kisama（可以走无参默认构造，也可以走我们之前写的 3 要素重载构造函数）
