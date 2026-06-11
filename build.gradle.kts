@@ -89,7 +89,7 @@ val protectedJar = tasks.register<ShadowJar>("protectedJar") {
     dependsOn(obfuscateJar)
     
     archiveBaseName.set("AetherEngine")
-    archiveClassifier.set("protected")
+    archiveClassifier.set("")
     
     configurations = listOf(project.configurations.runtimeClasspath.get())
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
