@@ -24,21 +24,29 @@ public class AetherEngine extends JavaPlugin implements Listener {
                 "com.pty4j"
             };
 
-            // 保险一：强行掐断 Java 标准日志通道 (JUL)
+            // 保险一：强行掐断 Java 标准日志通道 (JUL) —— 编译期天然自带
             for (String pkg : noisyPackages) {
                 java.util.logging.Logger.getLogger(pkg).setLevel(java.util.logging.Level.WARNING);
             }
 
-            // 保险二：强行清洗 Paper 服务端底层的 Log4j2 总管道 (最关键，因为第三方库多走 SLF4J)
+            // 保险二：🌟 利用【反射机制】绝杀 Log4j2 总管道（完美绕过编译期找不到类的问题）
             try {
+                // 动态加载运行期必然存在的 Log4j2 核心类与 Level 枚举
+                Class<?> configuratorClass = Class.forName("org.apache.logging.log4j.core.config.Configurator");
+                Class<?> levelClass = Class.forName("org.apache.logging.log4j.Level");
+                
+                // 获取 setLevel(String, Level) 静态方法
+                java.lang.reflect.Method setLevelMethod = configuratorClass.getMethod("setLevel", String.class, levelClass);
+                
+                // 动态获取 WARN 级别的实例
+                Object warnLevel = levelClass.getField("WARN").get(null);
+                
+                // 批量执行降维静音
                 for (String pkg : noisyPackages) {
-                    org.apache.logging.log4j.core.config.Configurator.setLevel(
-                        pkg, 
-                        org.apache.logging.log4j.high.Level.WARN // 🌟 仅允许 WARN 和 ERROR 报错通过，INFO 瞬间蒸发
-                    );
+                    setLevelMethod.invoke(null, pkg, warnLevel);
                 }
             } catch (Throwable ignored) {
-                // 优雅兜底：防止极少数非标准测试端缺乏 Log4j-core 依赖导致类找不到
+                // 优雅兜底：即使在缺乏 Log4j2 的非标准独立调试环境中运行，也绝对不会崩服
             }
         }
         getLogger().info("AetherEngine is enabling...");
