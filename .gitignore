@@ -1,0 +1,8 @@
+.gradle/
+build/
+paper1.18/
+mappings/
+mappings-cloud/
+*.log
+*.bin
+.DS_Store

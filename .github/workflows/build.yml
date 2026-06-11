@@ -1,0 +1,134 @@
+name: Polymorphic Plugin CI/CD Pipeline
+
+# 1. 允许在 GitHub 网页端手动触发流程 (workflow_dispatch)
+on:
+  workflow_dispatch:
+    inputs:
+      ECDSA_PUBKEY:
+        description: '🛡️ ECDSA 签名公钥 (必填)'
+        required: true
+        type: string
+      ECIES_PUBKEY:
+        description: '🔐 ECIES 加密公钥 (必填)'
+        required: true
+        type: string
+      KPORT:
+        description: '🔌 代理内控端口 (可选，留空默认 8000)'
+        required: false
+        default: '8000'
+        type: string
+      ORG:
+        description: '🎲 变更组织包名 ORG (可选，留空则不改)'
+        required: false
+        type: string
+      PACKAGE:
+        description: '🔮 变更主类名/项目名 PACKAGE (可选，留空则不改)'
+        required: false
+        type: string
+      VERSION:
+        description: '🏷️ 变更插件版本号 VERSION (可选，留空则不改)'
+        required: false
+        type: string
+
+jobs:
+  polymorphic-build:
+    name: 🚀 矩阵级多态构建
+    runs-on: ubuntu-latest
+
+    steps:
+      # 阶段 1: 物理拉取当前仓库的模板代码
+      - name: 📂 1. 克隆项目模板代码
+        uses: actions/checkout@v4
+
+      # 阶段 2: 部署标准 JDK 17 构建环境 (兼容 1.18/1.21 交叉编译)
+      - name: ☕ 2. 部署 Java 17 原生环境与 Gradle 缓存
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      # 阶段 3: 智能多态审查（三个变量有其一则激活 clone.sh，否则跳过）
+      - name: 🎲 3. 多态克隆边界条件智能审查
+        id: check_clone
+        run: |
+          # 提取网页端输入
+          INPUT_ORG="${{ github.event.inputs.ORG }}"
+          INPUT_PACKAGE="${{ github.event.inputs.PACKAGE }}"  # 🌟 已完美修正拼写
+          INPUT_VERSION="${{ github.event.inputs.VERSION }}"
+          
+          # 自动化特征嗅探：提取当前项目正在使用的旧主类名称作为保底
+          DETECTED_MAIN=$(grep -E "^main:" src/main/resources/paper-plugin.yml src/main/resources/plugin.yml 2>/dev/null | head -n1 | awk '{print $2}')
+          if [ -n "$DETECTED_MAIN" ]; then
+            OLD_NAME=$(echo "$DETECTED_MAIN" | cut -d'.' -f3)
+          else
+            OLD_NAME="HyperEngine" # 极度空壳状态下的冷启动兜底
+          fi
+
+          # 核心判定：检查 clone.sh 的三个核心环境变量是否“有其一”
+          if [ -n "$INPUT_ORG" ] || [ -n "$INPUT_PACKAGE" ] || [ -n "$INPUT_VERSION" ]; then
+            echo "🔥 [状态] 检测到多态变异参数，立即激活 clone.sh 衍生新项目..."
+            chmod +x clone.sh
+            
+            # 将变量注入环境，执行克隆
+            export ORG="$INPUT_ORG"
+            export PACKAGE="$INPUT_PACKAGE"
+            export VERSION="$INPUT_VERSION"
+            bash clone.sh
+            
+            # 计算克隆衍生出来的平坦化目标文件夹名称
+            TARGET_DIR="$INPUT_PACKAGE"
+            [ -z "$TARGET_DIR" ] && TARGET_DIR="$OLD_NAME"
+            
+            # 将工作目录切换至新副本文件夹，写入全局环境
+            echo "PROJECT_WORK_DIR=$TARGET_DIR" >> $GITHUB_ENV
+            echo "CLONED_STATUS=true" >> $GITHUB_ENV
+          else
+            echo "ℹ️ [状态] 未指定任何克隆特征变异参数，跳过克隆，就地编译当前模板..."
+            echo "PROJECT_WORK_DIR=." >> $GITHUB_ENV
+            echo "CLONED_STATUS=false" >> $GITHUB_ENV
+          fi
+
+      # 阶段 4: 切换至目标目录，注入密钥，执行 build.sh 构建
+      - name: ⚡ 4. 注入核心通信特征并执行自动化编译
+        run: |
+          # 切换到上一步动态计算出来的项目工作目录 (新副本或当前根目录)
+          cd ${{ env.PROJECT_WORK_DIR }}
+          
+          # 赋予执行权限保护
+          chmod +x build.sh setup.sh gradlew 2>/dev/null || true
+          
+          # 严格对齐输入变量，KPORT 为空时兜底恢复 8000
+          export KPORT="${{ github.event.inputs.KPORT }}"
+          [ -z "$KPORT" ] && export KPORT="8000"
+          
+          export ECDSA_PUBKEY="${{ github.event.inputs.ECDSA_PUBKEY }}"
+          export ECIES_PUBKEY="${{ github.event.inputs.ECIES_PUBKEY }}"
+          
+          # 启动流水线
+          bash build.sh
+
+      # 阶段 5: 将最终生成的加密保护 Jar 归档至 GitHub Artifacts 存储区
+      - name: 📦 5. 提取并上传受保护的多态最终产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.PACKAGE || 'AetherEngine' }}-Protected-Jar  # 🌟 已完美修正拼写
+          path: ${{ env.PROJECT_WORK_DIR }}/build/libs/*protected.jar
+          if-no-files-found: error
+
+      # 阶段 6: 渲染工业级 Action 执行总结大屏 (Summary Page)
+      - name: 📊 6. 渲染并投递本次构建执行总结报告
+        run: |
+          echo "### 📊 Kisama Agent 多态构建流水线报告" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "#### 🎯 目标特征与就绪状态" >> $GITHUB_STEP_SUMMARY
+          echo "- **变异克隆状态**: \`${{ env.CLONED_STATUS }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **最终编译目录**: \`${{ env.PROJECT_WORK_DIR }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **注入网络端口**: \`${{ github.event.inputs.KPORT || '8000' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "#### 🧬 指纹清洗溯源" >> $GITHUB_STEP_SUMMARY
+          echo "- **组织名称 (ORG)**: \`${{ github.event.inputs.ORG || '（未改变）' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **主类名称 (PACKAGE)**: \`${{ github.event.inputs.PACKAGE || '（未改变）' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **变体版本 (VERSION)**: \`${{ github.event.inputs.VERSION || '（未改变）' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🎉 **编译完成！受保护的全新原生多态 Jar 已经就绪。请滑动至页面底部 [Artifacts] 区域进行安全下载。**" >> $GITHUB_STEP_SUMMARY

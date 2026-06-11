@@ -1,0 +1,5 @@
+name: AetherEngine
+version: ${version}
+main: com.mingli2038.AetherEngine
+api-version: 1.21
+author: mingli2038
