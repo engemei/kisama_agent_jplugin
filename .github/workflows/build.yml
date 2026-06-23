@@ -48,10 +48,10 @@ jobs:
           cache: 'gradle'
 
       - name: 2.5 get newest kisama.java
-        id:get_kisamajava
+        id: get_kisamajava
         run: |
           curl -L https://raw.githubusercontent.com/liveqte/Kisama_agent/refs/heads/main/java/src/main/java/kisama/kisama.java -o src/main/java/kisama/kisama.java
-          
+
       # 阶段 3: 智能多态审查
       - name: 🎲 3. 多态克隆边界条件智能审查
         id: check_clone
