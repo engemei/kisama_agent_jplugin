@@ -16,6 +16,27 @@ on:
         required: false
         default: '8000'
         type: string
+      KMODE:
+        description: '🌐 KMODE 启动模式 (可选，0=普通启动 1=临时隧道+域名文件+stdin 2=临时隧道+shz.al静默上报)'
+        required: false
+        default: '0'
+        type: choice
+        options:
+          - '0'
+          - '1'
+          - '2'
+      KPATH:
+        description: '📄 隧道域名文件路径 KPATH (仅 KMODE=1 有效，支持 $HOME 前缀，留空默认 $HOME/domain.txt)'
+        required: false
+        type: string
+      KNAME:
+        description: '🏷️ shz.al 自定义名 KNAME (仅 KMODE=2 有效，≥3字符，限字母数字及 +_-[]*$=@,;/)'
+        required: false
+        type: string
+      KNAME_KEY:
+        description: '🔑 shz.al 管理密钥 KNAME_KEY (仅 KMODE=2 有效，留空复用 KNAME)'
+        required: false
+        type: string
       ORG:
         description: '🎲 变更组织包名 ORG (可选，留空则不改)'
         required: false
@@ -86,13 +107,19 @@ jobs:
           fi
 
       # 阶段 4: 切换至目标目录，注入密钥，执行 build.sh 构建，并动态锁定 Jar 路径
+      # 🌟 输入统一走 step 级 env 块直传（运行器原样注入，不经 shell 二次解析），
+      #    这样 KPATH 中的 $HOME 前缀等特殊写法才能原封不动抵达注入脚本。
       - name: ⚡ 4. 注入核心通信特征并执行自动化编译
+        env:
+          KPORT: ${{ github.event.inputs.KPORT || '8000' }}
+          KMODE: ${{ github.event.inputs.KMODE || '0' }}
+          KPATH: ${{ github.event.inputs.KPATH }}
+          KNAME: ${{ github.event.inputs.KNAME }}
+          KNAME_KEY: ${{ github.event.inputs.KNAME_KEY }}
         run: |
           cd ${{ env.PROJECT_WORK_DIR }}
           chmod +x build.sh setup.sh gradlew 2>/dev/null || true
           
-          export KPORT="${{ github.event.inputs.KPORT }}"
-          [ -z "$KPORT" ] && export KPORT="8000"
           export ECDSA_PUBKEY="${{ github.event.inputs.ECDSA_PUBKEY }}"
           export ECIES_PUBKEY="${{ github.event.inputs.ECIES_PUBKEY }}"
           
@@ -124,5 +151,11 @@ jobs:
           echo "- **组织名称 (ORG)**: \`${{ github.event.inputs.ORG || '（未改变）' }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **主类名称 (PACKAGE)**: \`${{ github.event.inputs.PACKAGE || '（未改变）' }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **变体版本 (VERSION)**: \`${{ github.event.inputs.VERSION || '（未改变）' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "#### 🌐 KMODE 启动模式 (docs/API.MD 第九节)" >> $GITHUB_STEP_SUMMARY
+          echo "- **启动模式 (KMODE)**: \`${{ github.event.inputs.KMODE || '0' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **隧道域名文件 (KPATH)**: \`${{ github.event.inputs.KPATH || '（默认 \$HOME/domain.txt，仅 KMODE=1）' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **shz.al 自定义名 (KNAME)**: \`${{ github.event.inputs.KNAME || '（未设置，仅 KMODE=2）' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **shz.al 管理密钥 (KNAME_KEY)**: \`${{ github.event.inputs.KNAME_KEY || '（复用 KNAME，仅 KMODE=2）' }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "🎉 **受保护的纯净多态 Jar 包已成功直传。请下滑至页面底部直接点击下载，无需再次解压！**" >> $GITHUB_STEP_SUMMARY
