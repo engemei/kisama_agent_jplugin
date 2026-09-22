@@ -30,13 +30,21 @@ on:
         required: false
         type: string
       KNAME:
-        description: '🏷️ shz.al 自定义名 KNAME (仅 KMODE=2 有效，≥3字符，限字母数字及 +_-[]*$=@,;/)'
+        description: '🏷️ shz.al 自定义名 KNAME (仅 KMODE=2 必填，≥3字符；若 KNAME_KEY 留空则需≥8字符。限字母数字及 +_-[]*$=@,;/)'
         required: false
         type: string
       KNAME_KEY:
-        description: '🔑 shz.al 管理密钥 KNAME_KEY (仅 KMODE=2 有效，留空复用 KNAME)'
+        description: '🔑 shz.al 管理密钥 KNAME_KEY (仅 KMODE=2，必须≥8字符；留空复用 KNAME，此时 KNAME 也需≥8字符)'
         required: false
         type: string
+      KISAMA_SOURCE:
+        description: '🧭 kisama.java 来源 (upstream=拉取 Kisama_agent main，默认；repo=用本仓库内置副本，用于验证未推上游的源码改动)'
+        required: false
+        default: 'upstream'
+        type: choice
+        options:
+          - 'upstream'
+          - 'repo'
       ORG:
         description: '🎲 变更组织包名 ORG (可选，留空则不改)'
         required: false
@@ -68,10 +76,26 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
-      - name: 2.5 get newest kisama.java
+      - name: 2.5 选择 kisama.java 来源 (upstream / repo)
         id: get_kisamajava
+        env:
+          KISAMA_SOURCE: ${{ github.event.inputs.KISAMA_SOURCE || 'upstream' }}
         run: |
-          curl -L https://raw.githubusercontent.com/liveqte/Kisama_agent/refs/heads/main/java/src/main/java/kisama/kisama.java -o src/main/java/kisama/kisama.java
+          KISAMA_FILE=src/main/java/kisama/kisama.java
+          if [ "$KISAMA_SOURCE" = "repo" ]; then
+            echo "🧭 本次使用【本仓库内置】的 kisama.java，跳过上游拉取（适合验证尚未推上 Kisama_agent main 的源码改动）"
+          else
+            echo "🧭 本次从【Kisama_agent main】拉取最新 kisama.java"
+            # 失败必须响亮：-f 让 404/网络错误直接红叉，避免把错误页喂给编译器后产出“看似成功”的废 jar
+            curl -fsSL --retry 3 --retry-delay 2 \
+              https://raw.githubusercontent.com/liveqte/Kisama_agent/refs/heads/main/java/src/main/java/kisama/kisama.java \
+              -o "$KISAMA_FILE"
+          fi
+          grep -q 'public class kisama' "$KISAMA_FILE" || {
+            echo "❌ $KISAMA_FILE 不是合法 Java 源码，终止构建"; exit 1; }
+          SUPPORTS=$(grep -q 'String bakedKmode' "$KISAMA_FILE" && echo yes || echo no)
+          echo "supports_baked=$SUPPORTS" >> "$GITHUB_OUTPUT"
+          echo "ℹ️ 该源码是否支持 KMODE 烘焙构造实参 (bakedKmode): $SUPPORTS"
 
       # 阶段 3: 智能多态审查
       - name: 🎲 3. 多态克隆边界条件智能审查
@@ -146,6 +170,8 @@ jobs:
           echo "- **变异克隆状态**: \`${{ env.CLONED_STATUS }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **最终编译目录**: \`${{ env.PROJECT_WORK_DIR }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **注入网络端口**: \`${{ github.event.inputs.KPORT || '8000' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **kisama.java 来源**: \`${{ github.event.inputs.KISAMA_SOURCE || 'upstream' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **支持 KMODE 烘焙构造实参**: \`${{ steps.get_kisamajava.outputs.supports_baked }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "#### 🧬 指纹清洗溯源" >> $GITHUB_STEP_SUMMARY
           echo "- **组织名称 (ORG)**: \`${{ github.event.inputs.ORG || '（未改变）' }}\`" >> $GITHUB_STEP_SUMMARY
