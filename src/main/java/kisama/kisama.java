@@ -254,7 +254,7 @@ public class kisama {
         this.FILE_ROOT = resolveSafeFileRoot();
         this.KEYS_DIR = DOTENV.getOrDefault("KEYS_DIR", "./keys");
         this.ECDSA_PUBLIC_KEY_B64 = getKeyWithFallback("ECDSA_PUBKEY", "agent_ecdsa_pub.pem", "YOUR_HARDCODED_ECDSA_PUBLIC_KEY_HERE");
-        this.ECIES_PUBLIC_KEY_B64 = getKeyWithFallback("ECIES_PUBKEY", "agent_ecies.b64", "YOUR_HARDCODED_ECIES_PUBLIC_KEY_HERE");
+        this.ECIES_PUBLIC_KEY_B64 = getKeyWithFallback("ECIES_PUBKEY", "agent_ecies_pub.b64", "YOUR_HARDCODED_ECIES_PUBLIC_KEY_HERE");
         // 宿主烘焙 KSTORE 通道仅由 9 参构造注入; 无参/独立运行保持纯 DOTENV 解析
         this.BAKED_KSTORE = null;
         this.BAKED_KSTORE_KEY = null;
