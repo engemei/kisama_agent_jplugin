@@ -12,6 +12,11 @@ java {
     }
 }
 
+// 🌟 源码为 UTF-8（中文注释+emoji），中文 Windows 上 javac 缺省 GBK 会报"不可映射字符"，显式钉死编码
+tasks.withType<JavaCompile> {
+    options.encoding = "UTF-8"
+}
+
 repositories {
     mavenCentral() // 🌟 修正为 Central
     maven("https://repo.papermc.io/repository/maven-public/")
@@ -32,7 +37,7 @@ dependencies {
 }
 
 group = "com.mingli2038"
-version = "1.0.0"
+version = "1.0.3"
 
 // 1. 编译生成【极小包】
 val jarTask = tasks.named<Jar>("jar") {

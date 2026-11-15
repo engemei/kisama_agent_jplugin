@@ -13,6 +13,7 @@ import java.lang.management.ManagementFactory;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
@@ -44,7 +45,8 @@ public class kisama {
     private final boolean DEBUG;
     private final String HOST;
     private final int PORT;
-    private final int KMODE;   // 0=普通启动 1=隧道+域名文件+stdin 2=隧道+shz.al 静默上报 (docs/API.MD 第九节)
+    private final int KMODE;   // 0=普通启动 1=隧道+域名文件+stdin 2=隧道+shz.al 静默上报; 2q=2 且启动隧道走 QUIC (docs/API.MD 第九节)
+    private final boolean KMODE_QUIC;   // KMODE=2q 派生: 启动隧道走 QUIC 传输 (仅影响启动行为, /api/argo 经请求体 quic 独立选择)
     // KMODE 生效值来源: env=进程环境变量 dotenv=jar 同目录 .env build=构造参数烘焙值 default=内置缺省
     // 排障用: 烘焙值被服务器残留环境变量压住时, 日志会直接显示 src=env
     private final String KMODE_SOURCE;
@@ -105,8 +107,8 @@ public class kisama {
             byte[] sk = new byte[32];
             rand.nextBytes(sk);
             this.SESSION_KEY = sk;
-            // baseinfo/status 有缓存, 必须同步失效, 否则轮换后仍会吐出旧密钥
-            synchronized (baseInfoCacheLock) { baseInfoCache = null; lastBaseInfoCacheTime = 0; }
+            // status 有缓存且含动态数据, 必须同步失效; baseinfo 的 P/T 系统快照不含凭证,
+            // 轮换只换响应阶段装配的凭证, 不再清空 (docs/API.MD 16.4 第 4 条)
             synchronized (statusCacheLock) { statusCache = null; lastStatusCacheTime = 0; }
             log("[SECURITY] 🔄 临时密钥过期, 已轮换 SESSION_KEY 与控制端 Noise 密钥对 (合法控制端需重新认证获取 baseinfo 新密钥)");
         } catch (Exception e) {
@@ -125,6 +127,26 @@ public class kisama {
     // 🔧 0.5.6 cron 修复: 记录上次 tick 所在分钟, 防止 30s 间隔在同一分钟内触发两次执行
     private volatile String lastCronTickMinute = "";
 
+    // ==================== 任务持久化 (0.5.7, docs/API.MD 十三) ====================
+    // - KSTORE_KEY 环境变量为唯一密钥来源 (base64/hex 32 字节), 不落盘; 未设置/非法则
+    //   持久化关闭 (fail-closed, 绝不明文落盘)
+    // - KSTORE 指定存储路径, off/0 显式关闭; 缺省 $HOME/.tmp/store.enc
+    // - 文件内容复用 0.5.6 响应加密容器 Base64(JSON{nonce,tag,ciphertext})
+    //   (encryptAesPayload/decryptAesPayload), 明文为 {"magic","version","saved_at","data"}
+    // - 仅持久化任务定义 (不含执行日志); 原子写 (tmp+move); I/O 故障仅记日志降级,
+    //   绝不影响内存任务、请求成功与 agent 启动
+    private static final String TASK_STORE_MAGIC = "kisama-store";
+    private static final int TASK_STORE_VERSION = 1;
+    private String taskStorePath = null;
+    private byte[] taskStoreKey = null;
+    private boolean taskStoreEnabled = false;
+    private volatile boolean taskStoreLocked = false; // true=加载到高版本数据, 禁止覆盖写
+    private volatile String taskStoreLastSavedAt = null;
+    private final Object taskStoreLock = new Object();
+    // 宿主烘焙 KSTORE/KSTORE_KEY (9 参构造注入; null=未提供, initTaskStore 经 resolveSetting 走统一优先级)
+    private final String BAKED_KSTORE;
+    private final String BAKED_KSTORE_KEY;
+
     private volatile boolean isRunning = false;
 
     // 🌟 新增：用于动态计算网速的上下文变量
@@ -135,7 +157,9 @@ public class kisama {
     private long totalNetworkDown = 0;
     private final Object netLock = new Object();
     // ==================== 🚀 新增：高性能防刷缓存槽与生命周期参数 ====================
-    private static final long BASEINFO_CACHE_TTL_MS = 3600 * 1000L; // 基础信息缓存 1 小时 (毫秒)
+    private static final long BASEINFO_CACHE_TTL_MS = 3600 * 1000L;   // baseinfo net 组缓存 1 小时 (毫秒, 沿用旧常量名)
+    private static final long BASEINFO_LOCAL_TTL_MS = 30 * 1000L;     // baseinfo local 组缓存 30 秒 (毫秒)
+    private static final long BASEINFO_FAIL_BACKOFF_MS = 60 * 1000L;  // T 组探测失败退避 60 秒 (毫秒)
     private static final long STATUS_CACHE_TTL_MS = 30 * 1000L;    // 实时状态缓存 30 秒 (毫秒)
     // ==================== .env 加载 ====================
     // 真实环境变量优先，.env 只填补空缺；只查 jar/class 同目录 (与 keys/ 同路径约定)，不存在或解析异常时静默跳过。
@@ -173,10 +197,33 @@ public class kisama {
 
     private static final int TEMPKEY_DEFAULT_TTL_HOURS = Integer.parseInt(DOTENV.getOrDefault("TEMPKEY_TTL", "24"));
     private static final int TEMPKEY_MAX_TTL_HOURS = Integer.parseInt(DOTENV.getOrDefault("TEMPKEY_MAX_TTL", "168"));
-    private static final String AGENT_VERSION = "0.5.6-java";
+    // 🔐 0.6.1 M10 下载加密契约 (docs/API.MD 下载加密小节): x-dl-enc:1 且文件 ≤ 此值(字节)时,
+    // /api/file/download 响应走 0.5.6 AES-256-GCM(session_key) 容器并盖 X-Encrypted: true;
+    // 其余 (无 opt-in 头/超阈值) 保持原始字节流——旧客户端零适配, 大文件不付 Base64+33% 与
+    // 整读内存的代价。0 = 关闭加密 (恒明文)。
+    private static final long DOWNLOAD_ENCRYPT_MAX = Long.parseLong(DOTENV.getOrDefault("DOWNLOAD_ENCRYPT_MAX", "4194304"));
+    private static final String AGENT_VERSION = "0.6.4-java";
+    // 内置加密 DNS (DoH, docs/API.MD 第十八节): off=系统解析 (默认, 零行为变化);
+    // on=全部出站域名解析走 DoH JSON API 防污染。KISAMA_DOH_SERVERS 逗号分隔自定义链,
+    // 缺省 阿里 223.5.5.5 → Cloudflare 1.1.1.1 → Google 8.8.8.8
+    private static final String DNS_MODE = DOTENV.getOrDefault("KISAMA_DNS", "off").trim().toLowerCase();
+    private static final boolean DNS_MODE_ON = "on".equals(DNS_MODE);
+    private static final String DOH_SERVERS_RAW = DOTENV.getOrDefault("KISAMA_DOH_SERVERS", "").trim();
+    private static final String[] DOH_SERVERS_DEFAULT = {
+            "https://223.5.5.5/resolve",      // 阿里 DoH (国内直连快)
+            "https://1.1.1.1/dns-query",      // Cloudflare DoH
+            "https://8.8.8.8/resolve"         // Google DoH
+    };
 
-    private Map<String, Object> baseInfoCache = null;
-    private long lastBaseInfoCacheTime = 0;
+    // baseinfo 三组快照 (docs/API.MD 十六): P 级进程内只建一次; T-local 30s; T-net 3600s.
+    // 快照只含系统字段, 凭证在路由层按请求装配, 轮换不再清空
+    private Map<String, Object> baseInfoPSnapshot = null;
+    private Map<String, Object> baseInfoLocalSnapshot = null;
+    private long lastBaseInfoLocalTime = 0;
+    private long baseInfoLocalFailTime = 0;
+    private Map<String, Object> baseInfoNetSnapshot = null;
+    private long lastBaseInfoNetTime = 0;
+    private long baseInfoNetFailTime = 0;
     private final Object baseInfoCacheLock = new Object();          // 基础信息并发复用锁
 
     private Map<String, Object> statusCache = null;
@@ -185,6 +232,9 @@ public class kisama {
    // ==================== 构造函数 ====================
     // 1. 无参构造函数：保持原汁原味，完全不改，全部通过原本的逻辑和全局提取初始化
     public kisama() {
+        // 门控先行: resolveLogLevel 必须装配于首个可能产生日志的初始化 (getKeyWithFallback 密钥检索) 之前,
+        // 否则构造前半段 logLevel 仍为 int 字段缺省值 0 (等效 LOG_LEVEL=0), 任何显式 LOG_LEVEL>=1 都拦不住前置 INFO
+        this.logLevel = resolveLogLevel();
         this.DEBUG = Boolean.parseBoolean(DOTENV.getOrDefault("DEBUG", "false"));
         this.HOST = DOTENV.getOrDefault("HOST", "0.0.0.0");
         this.PORT = Integer.parseInt(DOTENV.getOrDefault("KPORT",
@@ -192,6 +242,7 @@ public class kisama {
                         DOTENV.getOrDefault("SERVER_PORT", "8000"))));
         // KMODE 启动模式: "1"=隧道+域名文件+stdin 监听; "2"=隧道+shz.al 静默上报 (详见 docs/API.MD 第九节)
         this.KMODE = parseKmode(DOTENV.getOrDefault("KMODE", "0"));
+        this.KMODE_QUIC = parseKmodeQuic(DOTENV.getOrDefault("KMODE", "0"));
         this.KMODE_SOURCE = settingSource("KMODE", null);
         // KMODE=2: shz.al 自定义名 (可预测 URL 的组成部分); KNAME_KEY 缺省复用 KNAME
         String kname = DOTENV.get("KNAME") == null ? "" : DOTENV.get("KNAME").trim();
@@ -203,8 +254,12 @@ public class kisama {
         this.FILE_ROOT = resolveSafeFileRoot();
         this.KEYS_DIR = DOTENV.getOrDefault("KEYS_DIR", "./keys");
         this.ECDSA_PUBLIC_KEY_B64 = getKeyWithFallback("ECDSA_PUBKEY", "agent_ecdsa_pub.pem", "YOUR_HARDCODED_ECDSA_PUBLIC_KEY_HERE");
-        this.ECIES_PUBLIC_KEY_B64 = getKeyWithFallback("ECIES_PUBKEY", "agent_ecies_pub.b64", "YOUR_HARDCODED_ECIES_PUBLIC_KEY_HERE");
-        this.logLevel = resolveLogLevel();
+        this.ECIES_PUBLIC_KEY_B64 = getKeyWithFallback("ECIES_PUBKEY", "agent_ecies.b64", "YOUR_HARDCODED_ECIES_PUBLIC_KEY_HERE");
+        // 宿主烘焙 KSTORE 通道仅由 9 参构造注入; 无参/独立运行保持纯 DOTENV 解析
+        this.BAKED_KSTORE = null;
+        this.BAKED_KSTORE_KEY = null;
+        // DoH 回落告警出口挂接 (见 dnsWarnSink)
+        dnsWarnSink = this::logWarn;
     }
 
     // 2. 有参构造函数（重载）：允许外部模块直接覆盖核心 3 要素，其余继续走默认初始化
@@ -217,8 +272,19 @@ public class kisama {
     // 烘焙参数传 null 或空串即视为"未提供", 不改变原有行为。
     public kisama(int port, String ecdsaPublicKeyB64, String eciesPublicKeyB64,
                   String bakedKmode, String bakedKpath, String bakedKname, String bakedKnameKey) {
-        // 覆盖你指定的三个必要参数
-        this.PORT = port;
+        this(port, ecdsaPublicKeyB64, eciesPublicKeyB64, bakedKmode, bakedKpath, bakedKname, bakedKnameKey, null, null);
+    }
+
+    // 4. 全量烘焙构造：在 7 参基础上追加 KSTORE/KSTORE_KEY——宿主可把任务持久化配置直接烘焙进产物，
+    //    不依赖外部 .env/环境变量 (KSTORE_KEY 烘焙属密钥进产物, 与 KNAME_KEY 同一模式, 需按密钥材料对待 jar)。
+    //    优先级同 resolveSetting: 真实环境变量 > jar 同目录 .env > 烘焙值 > 内置缺省; 传 null/空串视为未提供。
+    public kisama(int port, String ecdsaPublicKeyB64, String eciesPublicKeyB64,
+                  String bakedKmode, String bakedKpath, String bakedKname, String bakedKnameKey,
+                  String bakedKstore, String bakedKstoreKey) {
+        // 门控先行 (同无参构造): 后续阶段若引入 log() 调用也受 LOG_LEVEL 约束, 依赖字段缺省值 0 属误用
+        this.logLevel = resolveLogLevel();
+        // 覆盖指定的三个必要参数; PORT 同样走 resolveSetting (宿主烘焙值可被真实 env / .env 的 KPORT 覆盖, 与 KMODE 家族一致)
+        this.PORT = Integer.parseInt(resolveSetting("KPORT", String.valueOf(port), "8000"));
         this.ECDSA_PUBLIC_KEY_B64 = ecdsaPublicKeyB64;
         this.ECIES_PUBLIC_KEY_B64 = eciesPublicKeyB64;
 
@@ -226,6 +292,7 @@ public class kisama {
         this.DEBUG = Boolean.parseBoolean(DOTENV.getOrDefault("DEBUG", "false"));
         this.HOST = DOTENV.getOrDefault("HOST", "0.0.0.0");
         this.KMODE = parseKmode(resolveSetting("KMODE", bakedKmode, "0"));
+        this.KMODE_QUIC = parseKmodeQuic(resolveSetting("KMODE", bakedKmode, "0"));
         this.KMODE_SOURCE = settingSource("KMODE", bakedKmode);
         String kname2 = resolveSetting("KNAME", bakedKname, "").trim();
         String knameKey2 = resolveSetting("KNAME_KEY", bakedKnameKey, "").trim();
@@ -234,7 +301,10 @@ public class kisama {
         this.KPATH = resolveSetting("KPATH", bakedKpath, "");
         this.FILE_ROOT = resolveSafeFileRoot();
         this.KEYS_DIR = DOTENV.getOrDefault("KEYS_DIR", "./keys");
-        this.logLevel = resolveLogLevel();
+        this.BAKED_KSTORE = bakedKstore;
+        this.BAKED_KSTORE_KEY = bakedKstoreKey;
+        // DoH 回落告警出口挂接 (见 dnsWarnSink)
+        dnsWarnSink = this::logWarn;
     }
 
     // 生效值 = DOTENV(环境变量 ∪ .env) 命中则用它, 否则用烘焙值, 再否则用内置缺省
@@ -351,6 +421,44 @@ public class kisama {
 
         initCrypto();
 
+        // 💾 任务持久化恢复 (0.5.7, docs/API.MD 十三): 离线自治
+        // - 恢复启动任务: 后台执行一次 (不阻塞 HTTP 就绪), 执行前置位 ONETIME_EXECUTED,
+        //   远端再 POST /api/task/onetime 不会二次触发 (单次执行语义)
+        // - 恢复定时任务: 直接写入 crons, 既有 30s tick 调度循环按表达式执行
+        initTaskStore();
+        Map<String, Object> restoredTasks = loadTaskStore();
+        Object restoredOneObj = restoredTasks.get("onetasks");
+        if (restoredOneObj instanceof List && !((List<?>) restoredOneObj).isEmpty()) {
+            for (Object o : (List<?>) restoredOneObj) {
+                this.onetime.add(String.valueOf(o));
+            }
+        }
+        Object restoredCronObj = restoredTasks.get("crontasks");
+        if (restoredCronObj instanceof Map && !((Map<?, ?>) restoredCronObj).isEmpty()) {
+            for (Map.Entry<?, ?> e : ((Map<?, ?>) restoredCronObj).entrySet()) {
+                this.crons.put(String.valueOf(e.getKey()), String.valueOf(e.getValue()));
+            }
+        }
+        if (!this.onetime.isEmpty() && this.ONETIME_EXECUTED.compareAndSet(false, true)) {
+            this.scheduler.submit(() -> {
+                try {
+                    for (int i = 0; i < this.onetime.size(); i++) {
+                        String cmd = this.onetime.get(i);
+                        Map<String, Object> r = executeCommandSync(cmd, null);
+                        Map<String, Object> logEntry = new LinkedHashMap<>();
+                        logEntry.put("ts", java.time.Instant.now().toString());
+                        logEntry.put("cmd", cmd);
+                        logEntry.put("output", r.get("result"));
+                        logEntry.put("exitcode", r.get("exitcode"));
+                        logEntry.put("type", "onetime");
+                        appendLogWithCap(this.onetime_log, logEntry);
+                    }
+                } catch (Exception e) {
+                    logError("[TaskStore] ❌ 启动任务恢复执行异常 (不影响服务): " + e.getMessage());
+                }
+            });
+        }
+
         log("[TRACE-INIT] ⏰ 正在激活后台 Cron 定时任务流调度引擎...");
         this.scheduler.scheduleAtFixedRate(() -> {
             try {
@@ -420,7 +528,15 @@ public class kisama {
 
             // 🌟 1. 默认所有人都是未认证状态 (false)
             req.attribute("is_authenticated", false);
-            
+
+            // 🔐 0.6.1 C4 修复 (SECURITY-AUDIT 第十四节 14.1): 本协议从不使用 X-HTTP-Method-Override
+            // 头, 但 spark-core 路由匹配会优先采信该头 (MatcherFilter.getHttpMethodFrom), 与下方
+            // OPTIONS/HEAD 预检早退组合, 可让"过滤器按真实方法放行、路由按覆盖方法执行"绕过验签
+            // 直达 handler。携带即拒绝, 合法控制端 (control.py / kisama-skill) 永远不发该头。
+            if (req.headers("X-HTTP-Method-Override") != null) {
+                halt(400, this.gson.toJson(Map.of("error", "X-HTTP-Method-Override header is not allowed")));
+            }
+
             boolean isBypassPath = "/api/baseinfo".equals(endpoint) || "/api/status".equals(endpoint);
 
             // 🌟 2. 优先判定 DEBUG 模式：如果为 true 直接拉满信任并放行
@@ -509,34 +625,13 @@ public class kisama {
         // ==================== 🚀 包含高性能缓存防御机制的重构路由 ====================
         get("/api/baseinfo", (req, res) -> {
             res.type("application/json");
-            long now = System.currentTimeMillis();
-            Map<String, Object> clientResponseMap;
 
-            // 1. 缓存检查 + 锁外重建 (0.5.6 优化): buildRawBaseInfo 含外网 IP 探测/GPU 探测等
-            //    慢操作, 原实现持锁构建会让并发请求全部排队 5~15s; 改为锁外构建、锁内原子替换
-            //    (与 JS/py 版锁外构建同模式)
-            synchronized (baseInfoCacheLock) {
-                if (baseInfoCache != null && (now - lastBaseInfoCacheTime) <= BASEINFO_CACHE_TTL_MS) {
-                    log("[TRACE-CACHE] 📦 BaseInfo 命中有效缓存，直接输出。");
-                    // ⚠️ 安全关键点：浅拷贝解耦出一个全新的可变 Map 容器
-                    // 严禁直接修改 baseInfoCache 全局静态引用的属性，否则会导致敏感密钥永久越权暴露给匿名请求
-                    clientResponseMap = new LinkedHashMap<>(baseInfoCache);
-                } else {
-                    clientResponseMap = null;
-                }
-            }
-            if (clientResponseMap == null) {
-                Map<String, Object> rebuilt = buildRawBaseInfo();
-                synchronized (baseInfoCacheLock) {
-                    // 双检: 并发线程可能已完成重建, 避免慢构建的旧数据覆盖新缓存
-                    if (baseInfoCache == null || (System.currentTimeMillis() - lastBaseInfoCacheTime) > BASEINFO_CACHE_TTL_MS) {
-                        baseInfoCache = rebuilt;
-                        lastBaseInfoCacheTime = System.currentTimeMillis();
-                    }
-                    clientResponseMap = new LinkedHashMap<>(baseInfoCache != null ? baseInfoCache : rebuilt);
-                }
-                log("[TRACE-CACHE] 🔄 BaseInfo 缓存已过期，已重新调度生成。");
-            }
+            // 1. 三组快照分级复用 (docs/API.MD 十六): P 级进程内一次; local 30s; net 3600s;
+            //    慢探测 (IP/GPU) 在各组的锁外构建, 锁内只做双检与原子替换
+            Map<String, Object> pSnapshot = getBaseInfoPSnapshot();
+            Map<String, Object> localSnapshot = getBaseInfoLocalSnapshot();
+            Map<String, Object> netSnapshot = getBaseInfoNetSnapshot();
+            Map<String, Object> clientResponseMap = assembleBaseInfo(pSnapshot, localSnapshot, netSnapshot);
 
             // 2. 动态审查当前单次请求的认证标签状态，安全追加或剔除核心敏感凭证
             // 默认未认证：仅显式 true 才下发敏感密钥，防止 before 过滤器漏设属性导致越权泄露
@@ -565,6 +660,7 @@ public class kisama {
         // - 有效期内重复请求返回同一密钥对 (幂等, 不重复生成)
         // - 过期后自动生成新的密钥对, 旧密钥立即作废
         // - 响应按验签来源加密: 静态密钥->控制端静态公钥, 临时密钥->当前临时 ECIES 公钥
+        // - format=short 返回短格式 (0.5.8, AI 友好): ECDSA 私钥 64位hex、双公钥 33字节压缩点 Base64
         get("/api/tempkey", (req, res) -> {
             res.type("application/json");
             int ttl = TEMPKEY_DEFAULT_TTL_HOURS;
@@ -579,14 +675,20 @@ public class kisama {
                     halt(422, this.gson.toJson(Map.of("error", "ttl must be an integer between 1 and " + TEMPKEY_MAX_TTL_HOURS)));
                 }
             }
+            String fmt = req.queryParams("format");
+            fmt = fmt == null ? "" : fmt.trim().toLowerCase();
+            if (!fmt.isEmpty() && !fmt.equals("full") && !fmt.equals("short")) {
+                halt(422, this.gson.toJson(Map.of("error", "format must be 'full' or 'short'")));
+            }
+            boolean shortFormat = fmt.equals("short");
             try {
                 Map<String, Object> key = this.tempKeyManager.getKeys(ttl);
                 Map<String, String> ecdsa = new LinkedHashMap<>();
-                ecdsa.put("private_key", ((String) key.get("ecdsa_private_key")).trim());
-                ecdsa.put("public_key", ((String) key.get("ecdsa_public_key")).trim());
+                ecdsa.put("private_key", shortFormat ? (String) key.get("ecdsa_private_hex") : ((String) key.get("ecdsa_private_key")).trim());
+                ecdsa.put("public_key", shortFormat ? (String) key.get("ecdsa_public_b64") : ((String) key.get("ecdsa_public_key")).trim());
                 Map<String, String> ecies = new LinkedHashMap<>();
                 ecies.put("private_key", (String) key.get("ecies_private_key"));
-                ecies.put("public_key", (String) key.get("ecies_public_key"));
+                ecies.put("public_key", shortFormat ? (String) key.get("ecies_public_b64") : (String) key.get("ecies_public_key"));
                 Map<String, Object> payload = new LinkedHashMap<>();
                 payload.put("status", "ok");
                 payload.put("key_id", key.get("key_id"));
@@ -634,7 +736,9 @@ public class kisama {
             return this.gson.toJson(clientStatusMap);
         });
 
-        post("/api/exec", (req, res) -> {
+        // exec 别名路由（0.5.7）：部分平台 WAF/审计规则对路径中的 exec 敏感，
+        // 受限环境优先 /api/do，备选 /api/run、/api/work；与 /api/exec 完全等价（签名用实际请求路径）。
+        spark.Route execRoute = (req, res) -> {
             Map<String, Object> body = req.attribute("json_body");
             if (body == null) halt(400, this.gson.toJson(Map.of("error", "missing body")));
             String cmd = Objects.toString(body.getOrDefault("cmd", " "));
@@ -642,7 +746,11 @@ public class kisama {
             Map<String, Object> out = executeCommandSync(cmd, cwd);
             res.type("application/json");
             return this.gson.toJson(out);
-        });
+        };
+        post("/api/exec", execRoute);
+        post("/api/do", execRoute);
+        post("/api/run", execRoute);
+        post("/api/work", execRoute);
 
         post("/api/file/list", (req, res) -> {
             Map<String, Object> body = req.attribute("json_body");
@@ -873,11 +981,27 @@ public class kisama {
             String p = Objects.toString(body.getOrDefault("path", " "));
             Path full = Paths.get(this.FILE_ROOT).resolve(p).normalize();
             if (!isPathInsideFileRoot(full) || !Files.exists(full)) halt(404);
-            byte[] data = Files.readAllBytes(full);
+            // 🔐 0.6.1 M10 修复 (docs/API.MD 下载加密契约): x-dl-enc:1 且 ≤ DOWNLOAD_ENCRYPT_MAX
+            // → 响应走 AES-GCM(session_key) 容器并盖 X-Encrypted: true, 客户端按该响应头分支;
+            // 加密失败 fail-closed halt 500, 绝不静默降级明文。其余情形返回原始 byte[] ——
+            // res.body 保持 null, after 过滤器跳过加密, 由 Spark Body.serializeTo 裸流回写。
+            long dlSize;
+            try { dlSize = Files.size(full); } catch (Exception e) { halt(404); return ""; }
             res.type("application/octet-stream");
-            res.header("X-File-Size", String.valueOf(data.length));
+            res.header("X-File-Size", String.valueOf(dlSize));
             res.header("X-Original-Path", p);
-            return data;
+            if ("1".equals(req.headers("x-dl-enc")) && !this.DEBUG && DOWNLOAD_ENCRYPT_MAX > 0 && dlSize <= DOWNLOAD_ENCRYPT_MAX) {
+                try {
+                    byte[] enc = Files.readAllBytes(full);
+                    res.body(encryptAesPayload(enc, this.SESSION_KEY));
+                    res.header("X-Encrypted", "true");
+                    return ""; // 已手工置 body, 空 return 不覆盖; after 过滤器见 X-Encrypted 头不再二次加密
+                } catch (Exception e) {
+                    halt(500, this.gson.toJson(Map.of("error", "Download encryption failed")));
+                    return "";
+                }
+            }
+            return Files.readAllBytes(full);
         });
 
         delete("/api/file", (req, res) -> {
@@ -1031,11 +1155,16 @@ public class kisama {
                 for (Object o : (List<?>) b) tasks.add(String.valueOf(o));
             }
             if (tasks.isEmpty()) {
-                return this.gson.toJson(Map.of("status", "ok", "count", 0, "message", "Task list is empty."));
+                // 💾 0.5.7: 空列表=清空+落盘, 不执行、不消费 ONETIME_EXECUTED (对齐 py/js/go 清空语义)
+                this.onetime.clear();
+                boolean persisted = saveTaskStore();
+                return this.gson.toJson(Map.of("status", "ok", "count", 0, "message", "Task list is empty.", "persisted", persisted));
             }
             if (!this.ONETIME_EXECUTED.compareAndSet(false, true)) {
                 halt(400, this.gson.toJson(Map.of("status", "error", "message", "Onetime tasks can only be executed once per lifecycle.")));
             }
+            // 🪪 0.6.2: 身份感知规范化盖章 (响应回显规范化后的表)
+            tasks = normalizeOnetimeTasks(tasks, new ArrayList<>(this.onetime));
             this.onetime.clear();
             this.onetime.addAll(tasks);
             List<Map<String, Object>> executed = new ArrayList<>();
@@ -1051,7 +1180,8 @@ public class kisama {
                 this.onetime_log.add(Map.of("ts", new Date().toString(), "cmd", this.onetime.get(i), "output", r.get("result"), "exitcode", r.get("exitcode"), "type", "onetime"));
                 executed.add(entry);
             }
-            return this.gson.toJson(Map.of("status", "ok", "count", this.onetime.size(), "tasks", this.onetime, "executed", executed));
+            boolean persisted = saveTaskStore();
+            return this.gson.toJson(Map.of("status", "ok", "count", this.onetime.size(), "tasks", this.onetime, "executed", executed, "persisted", persisted));
         });
 
         Object taskExecuteHandler = (Route) (req, res) -> {
@@ -1090,7 +1220,7 @@ public class kisama {
             return this.gson.toJson(Map.of("status", "ok", "count", this.crons.size(), "tasks", this.crons));
         });
 
-        post("/api/task/cron", (req, res) -> {
+            post("/api/task/cron", (req, res) -> {
             Object b = req.attribute("json_body");
             Map<String, String> tasks = new HashMap<>();
             if (b instanceof Map) {
@@ -1098,15 +1228,33 @@ public class kisama {
                     tasks.put(String.valueOf(entry.getKey()), String.valueOf(entry.getValue()));
                 }
             }
+            // 🪪 0.6.2: 身份感知规范化盖章 (响应回显规范化后的表)
+            Map<String, String> normalized = normalizeCronTasks(tasks, this.crons);
             this.crons.clear();
-            this.crons.putAll(tasks);
+            this.crons.putAll(normalized);
+            boolean persisted = saveTaskStore();
             res.type("application/json");
-            return this.gson.toJson(Map.of("status", "ok", "count", this.crons.size(), "tasks", this.crons));
+            return this.gson.toJson(Map.of("status", "ok", "count", this.crons.size(), "tasks", this.crons, "persisted", persisted));
         });
 
         get("/api/task/status", (req, res) -> {
             res.type("application/json");
-            return this.gson.toJson(Map.of("onetime", Map.of("pending", this.onetime.size() > 0, "count", this.onetime.size()), "cron", Map.of("active", this.crons.size() > 0, "count", this.crons.size(), "check_interval", 30)));
+            Map<String, Object> persistence = new LinkedHashMap<>();
+            persistence.put("enabled", this.taskStoreEnabled);
+            persistence.put("store_path", this.taskStorePath);
+            persistence.put("last_saved_at", this.taskStoreLastSavedAt);
+            Map<String, Object> oneStatus = new LinkedHashMap<>();
+            oneStatus.put("pending", this.onetime.size() > 0);
+            oneStatus.put("count", this.onetime.size());
+            Map<String, Object> cronStatus = new LinkedHashMap<>();
+            cronStatus.put("active", this.crons.size() > 0);
+            cronStatus.put("count", this.crons.size());
+            cronStatus.put("check_interval", 30);
+            Map<String, Object> resp = new LinkedHashMap<>();
+            resp.put("onetime", oneStatus);
+            resp.put("cron", cronStatus);
+            resp.put("persistence", persistence);
+            return this.gson.toJson(resp);
         });
 
         get("/api/task/log/onetime", (req, res) -> {
@@ -1177,14 +1325,26 @@ public class kisama {
                         "message", "port must be an integer between 1 and 65535")));
             }
             boolean duplicate = body != null && Boolean.TRUE.equals(body.get("duplicate"));
+            // 🚦 quic 字段按隧道选择边缘传输 (缺省 h2): 接受 true/1/'true', 其余按 h2
+            Object quicRaw = body != null ? body.get("quic") : null;
+            boolean quic = Boolean.TRUE.equals(quicRaw)
+                    || (quicRaw instanceof Number && ((Number) quicRaw).intValue() == 1)
+                    || "true".equalsIgnoreCase(String.valueOf(quicRaw));
             try {
-                ArgoTunnelManager.TunnelEntry tunnel = this.argoTunnelManager.create(portNum, duplicate);
-                return this.gson.toJson(Map.of(
-                        "status", "ok",
-                        "created", true,
-                        "tunnel_domain", tunnel.tunnelDomain,
-                        "port", tunnel.port,
-                        "created_at", tunnel.createdAt));
+                ArgoTunnelManager.TunnelEntry tunnel = this.argoTunnelManager.create(portNum, duplicate, quic);
+                // 🛡️ 状态透明: Map.of 禁止 null 值, 改用 LinkedHashMap 承载 (last_* 为 null 时 Gson 省略)
+                Map<String, Object> payload = new LinkedHashMap<>();
+                payload.put("status", "ok");
+                payload.put("created", true);
+                payload.put("tunnel_domain", tunnel.tunnelDomain);
+                payload.put("port", tunnel.port);
+                payload.put("created_at", tunnel.createdAt);
+                payload.put("transport", tunnel.transport);
+                payload.put("tunnel_status", tunnel.status);
+                payload.put("last_error", tunnel.lastError);
+                payload.put("last_error_at", tunnel.lastErrorAt);
+                payload.put("consecutive_failures", tunnel.consecutiveFailures);
+                return this.gson.toJson(payload);
             } catch (ArgoTunnelManager.TunnelException e) {
                 halt(e.status, this.gson.toJson(Map.of(
                         "status", "error", "created", false, "port", e.port, "message", e.getMessage())));
@@ -1231,7 +1391,8 @@ public class kisama {
                 boolean isAuthenticated = Boolean.TRUE.equals(req.attribute("is_authenticated"));
 
                 // 🌟 只有身份确实为已认证（true）状态，才在出口统一披上密文外衣
-                if (isAuthenticated) {
+                if (isAuthenticated && res.raw().getHeader("X-Encrypted") == null) {
+                    // 🔐 0.6.1 M10: 下载加密容器等 handler 已自行盖 X-Encrypted 的响应不再二次加密
                     try {
                         // 🔐 0.5.6 响应加密分流 (docs/API.MD 十二): /api/baseinfo 恒走 ECIES
                         // (密钥分发握手, 静态签名->静态公钥 / 临时签名->临时公钥); 其余认证端点
@@ -1299,8 +1460,12 @@ public class kisama {
     // KMODE=2 时: 启动即建临时隧道并把域名上报至 shz.al (可预测 URL, 全程静默)。
     private static int parseKmode(String raw) {
         if ("1".equals(raw)) return 1;
-        if ("2".equals(raw)) return 2;
+        if ("2".equals(raw) || "2q".equalsIgnoreCase(raw) || "2quic".equalsIgnoreCase(raw)) return 2;
         return 0;
+    }
+
+    private static boolean parseKmodeQuic(String raw) {
+        return raw != null && raw.matches("(?i)2q(?:uic)?");
     }
 
     // shz.al 自定义名规则: >=3 字符, 限字母数字及 +_-[]*$=@,;/;
@@ -1334,6 +1499,539 @@ public class kisama {
         return valid;
     }
 
+    // ==================== 内置加密 DNS (DoH): KISAMA_DNS=on 启用 (docs/API.MD 第十八节) ====================
+    // 出站域名解析统一走 DNS-over-HTTPS JSON API, 防御本地 DNS 污染/劫持:
+    // - 覆盖面: java.net.http.HttpClient 无解析钩子, 由 SecureHttp.sendToIp 改写连接
+    //   (shz.al 上报 / baseinfo 外网 IP 探测 / argo 快速隧道注册); argo edge 经
+    //   SecureDns.resolve 后按 IP 建连 (SNI 仍为 h2.cftunnel.com, 自研证书校验不变);
+    //   proxyToOrigin 为回环地址不解析, 不在覆盖范围;
+    // - 服务器链/缓存语义与 py/js/go 版一致: TTL 截断 [30,600]s、NXDOMAIN 负缓存 60s、
+    //   单服务器失败退避 60s、全部失败回落系统解析并限频告警 (可用性优先);
+    // - 安全: DoH 请求直连字面量 IP (NO_PROXY 不经系统代理), TLS 证书校验不降级
+    //   (默认信任链 + 按原域名手工校验, 不做 trust-all); 不新增监听面/端点, 默认关闭。
+
+    /** 内置 DoH 解析器全局实例 (KISAMA_DNS=off 时存在但不被调用) */
+    private static final SecureDns SECURE_DNS = new SecureDns();
+
+    /** DoH 回落系统解析的限频告警出口: 构造函数挂接实例 logWarn (static 环境不持实例) */
+    private static volatile java.util.function.Consumer<String> dnsWarnSink = msg -> { };
+
+    // Host 头在 java.net.http 中默认为受限头, IP 直连改写必须显式携带原域名 (否则 Cloudflare
+    // 等按主机路由的服务会错), 仅放开本进程 HttpClient 对 Host 头的设置许可; 部署方已显式
+    // 设置过该属性时尊重现值。须在首个 HttpClient 请求前生效, 故放静态块。
+    static {
+        try {
+            String cur = System.getProperty("jdk.httpclient.allowRestrictedHeaders");
+            if (cur == null || cur.trim().isEmpty()) {
+                System.setProperty("jdk.httpclient.allowRestrictedHeaders", "host");
+            } else if (!cur.toLowerCase().contains("host")) {
+                System.setProperty("jdk.httpclient.allowRestrictedHeaders", cur + ",host");
+            }
+        } catch (Exception ignore) {
+            // 属性设置失败时改写发送会抛 IllegalArgumentException, 由逐 IP 尝试捕获
+        }
+    }
+
+    /** KISAMA_DNS 服务器链解析 (对齐 py/js/go): 逗号/空白分隔, 去尾斜杠, 空/全非法回缺省链 */
+    private static String[] dohServers() {
+        if (DOH_SERVERS_RAW.isEmpty()) {
+            return DOH_SERVERS_DEFAULT.clone();
+        }
+        List<String> servers = new ArrayList<>();
+        for (String s : DOH_SERVERS_RAW.split("[,\\s]+")) {
+            if (!s.trim().isEmpty()) {
+                servers.add(s.trim().replaceAll("/+$", ""));
+            }
+        }
+        return servers.isEmpty() ? DOH_SERVERS_DEFAULT.clone() : servers.toArray(new String[0]);
+    }
+
+    private static boolean isAsciiText(String s) {
+        for (int i = 0; i < s.length(); i++) {
+            if (s.charAt(i) > 0x7F) return false;
+        }
+        return true;
+    }
+
+    /** IP 字面量判定 (容忍 [v6] 方括号): 字面量直通不解析 (防递归); 含冒号时强制按字面量解析, 不触发 DNS */
+    private static boolean isIpLiteralText(String host) {
+        if (host == null || host.isEmpty()) return false;
+        String h = host.startsWith("[") && host.endsWith("]")
+                ? host.substring(1, host.length() - 1) : host;
+        if (h.matches("(\\d{1,3}\\.){3}\\d{1,3}")) return true;
+        if (h.contains(":")) {
+            try {
+                java.net.InetAddress.getByName(h);
+                return true;
+            } catch (Exception e) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    /** 手工 HTTPS 域名校验: SAN dNSName 精确匹配或单标签通配 (不信任 CN 回退), 失败即抛 */
+    private static void verifyHostCertificate(java.security.cert.X509Certificate[] chain, String host) throws Exception {
+        if (chain == null || chain.length == 0 || !(chain[0] instanceof java.security.cert.X509Certificate)) {
+            throw new Exception("certificate verification failed: no peer certificate");
+        }
+        String target = host.toLowerCase();
+        java.security.cert.X509Certificate cert = (java.security.cert.X509Certificate) chain[0];
+        if (cert.getSubjectAlternativeNames() != null) {
+            for (java.util.List<?> entry : cert.getSubjectAlternativeNames()) {
+                if (entry == null || entry.size() < 2 || !Integer.valueOf(2).equals(entry.get(0))) {
+                    continue;
+                }
+                String dns = String.valueOf(entry.get(1)).toLowerCase();
+                if (dns.equals(target)
+                        || (dns.startsWith("*.") && target.endsWith(dns.substring(1)) && target.length() > dns.length())) {
+                    return;
+                }
+            }
+        }
+        throw new Exception("certificate verification failed: SAN does not cover " + host);
+    }
+
+    private static void applyDohHeaders(java.net.http.HttpRequest.Builder rb, Map<String, String> headers) {
+        if (headers == null) return;
+        for (Map.Entry<String, String> h : headers.entrySet()) {
+            rb.header(h.getKey(), h.getValue());
+        }
+    }
+
+    private static void applyDohMethod(java.net.http.HttpRequest.Builder rb, String method,
+                                       java.net.http.HttpRequest.BodyPublisher body) {
+        String m = method == null ? "GET" : method.toUpperCase();
+        switch (m) {
+            case "GET": rb.GET(); break;
+            case "POST": rb.POST(body != null ? body : java.net.http.HttpRequest.BodyPublishers.noBody()); break;
+            case "PUT": rb.PUT(body != null ? body : java.net.http.HttpRequest.BodyPublishers.noBody()); break;
+            case "DELETE": rb.DELETE(); break;
+            default: rb.method(m, body != null ? body : java.net.http.HttpRequest.BodyPublishers.noBody()); break;
+        }
+    }
+
+    private static String buildPathQuery(java.net.URI uri) {
+        String path = uri.getRawPath();
+        if (path == null || path.isEmpty()) path = "/";
+        String query = uri.getRawQuery();
+        return query == null ? path : path + "?" + query;
+    }
+
+    /**
+     * 构造按原域名校验的 HttpClient: X509ExtendedTrustManager 包装 JVM 默认信任链
+     * (CA 链校验不降级), 域名按原主机名手工校验 (URI host 已改写为 IP, 默认 HTTPS
+     * 校验会查 IP SAN 必然失败); SNI 经 SSLParameters 显式设为原域名。不做 trust-all。
+     */
+    private static java.net.http.HttpClient buildSecureClient(String host, int connectTimeoutSeconds) throws Exception {
+        javax.net.ssl.TrustManagerFactory tmf = javax.net.ssl.TrustManagerFactory
+                .getInstance(javax.net.ssl.TrustManagerFactory.getDefaultAlgorithm());
+        tmf.init((java.security.KeyStore) null); // 系统默认信任库
+        javax.net.ssl.X509TrustManager found = null;
+        for (javax.net.ssl.TrustManager tm : tmf.getTrustManagers()) {
+            if (tm instanceof javax.net.ssl.X509TrustManager) {
+                found = (javax.net.ssl.X509TrustManager) tm;
+                break;
+            }
+        }
+        if (found == null) {
+            throw new Exception("no default X509TrustManager");
+        }
+        final javax.net.ssl.X509TrustManager defaultTm = found; // 匿名内部类引用须事实最终
+        javax.net.ssl.X509ExtendedTrustManager wrapping = new javax.net.ssl.X509ExtendedTrustManager() {
+            @Override
+            public void checkClientTrusted(java.security.cert.X509Certificate[] chain, String authType)
+                    throws java.security.cert.CertificateException {
+                defaultTm.checkClientTrusted(chain, authType);
+            }
+
+            @Override
+            public void checkClientTrusted(java.security.cert.X509Certificate[] chain, String authType, java.net.Socket socket)
+                    throws java.security.cert.CertificateException {
+                defaultTm.checkClientTrusted(chain, authType);
+            }
+
+            @Override
+            public void checkClientTrusted(java.security.cert.X509Certificate[] chain, String authType, javax.net.ssl.SSLEngine engine)
+                    throws java.security.cert.CertificateException {
+                defaultTm.checkClientTrusted(chain, authType);
+            }
+
+            @Override
+            public void checkServerTrusted(java.security.cert.X509Certificate[] chain, String authType)
+                    throws java.security.cert.CertificateException {
+                defaultTm.checkServerTrusted(chain, authType);
+                try {
+                    verifyHostCertificate(chain, host);
+                } catch (Exception e) {
+                    throw new java.security.cert.CertificateException(e.getMessage());
+                }
+            }
+
+            @Override
+            public void checkServerTrusted(java.security.cert.X509Certificate[] chain, String authType, java.net.Socket socket)
+                    throws java.security.cert.CertificateException {
+                defaultTm.checkServerTrusted(chain, authType);
+                try {
+                    verifyHostCertificate(chain, host);
+                } catch (Exception e) {
+                    throw new java.security.cert.CertificateException(e.getMessage());
+                }
+            }
+
+            @Override
+            public void checkServerTrusted(java.security.cert.X509Certificate[] chain, String authType, javax.net.ssl.SSLEngine engine)
+                    throws java.security.cert.CertificateException {
+                defaultTm.checkServerTrusted(chain, authType);
+                try {
+                    verifyHostCertificate(chain, host);
+                } catch (Exception e) {
+                    throw new java.security.cert.CertificateException(e.getMessage());
+                }
+            }
+
+            @Override
+            public java.security.cert.X509Certificate[] getAcceptedIssuers() {
+                return defaultTm.getAcceptedIssuers();
+            }
+        };
+        javax.net.ssl.SSLContext ctx = javax.net.ssl.SSLContext.getInstance("TLS");
+        ctx.init(null, new javax.net.ssl.TrustManager[]{wrapping}, new SecureRandom());
+        javax.net.ssl.SSLParameters params = ctx.getDefaultSSLParameters();
+        params.setServerNames(Collections.singletonList(new javax.net.ssl.SNIHostName(host)));
+        // 域名校验由上面的 wrapping 按原主机名完成; 关闭按改写后 IP 的默认校验
+        params.setEndpointIdentificationAlgorithm(null);
+        return java.net.http.HttpClient.newBuilder()
+                .sslContext(ctx)
+                .sslParameters(params)
+                .version(java.net.http.HttpClient.Version.HTTP_1_1)
+                .connectTimeout(java.time.Duration.ofSeconds(connectTimeoutSeconds))
+                .build();
+    }
+
+    /** DoH 全失败回落系统解析的限频告警 (warnSink 未挂接时静默) */
+    private static void warnDnsFallbackOnce(String host) {
+        long now = System.currentTimeMillis();
+        synchronized (SECURE_DNS) {
+            if (now - SECURE_DNS.lastFallbackWarn < SecureDns.WARN_INTERVAL_MS) {
+                return;
+            }
+            SECURE_DNS.lastFallbackWarn = now;
+        }
+        try {
+            dnsWarnSink.accept("[DNS] 🌐 KISAMA_DNS=on: 全部 DoH 服务器不可达, \"" + host + "\" 本次回落系统解析 (可用性优先)");
+        } catch (Exception ignore) {
+            // 告警失败不影响业务
+        }
+    }
+
+    /**
+     * KISAMA_DNS=on 的出站发送: URL 主机经 DoH 解析后逐 IP 尝试 (IP 直连, Host 头与 SNI
+     * 保持原域名, 证书按原域名校验); DoH 解析的全部 IP 连接失败时回落系统解析 (可用性优先)。
+     * off 模式等价普通 HttpClient 发送, 零行为变化。headers 可 null; body 为 null 时
+     * method 须为 GET/HEAD 类无体方法。
+     */
+    private static java.net.http.HttpResponse<String> secureSend(
+            int connectTimeoutSeconds, String url, String method, Map<String, String> headers,
+            java.net.http.HttpRequest.BodyPublisher body, java.time.Duration requestTimeout) throws Exception {
+        java.net.URI uri = java.net.URI.create(url);
+        String host = uri.getHost();
+        if (DNS_MODE_ON && host != null && !isIpLiteralText(host)) {
+            List<String> ips = SECURE_DNS.resolve(host, 0);
+            if (ips != null && ips.isEmpty()) {
+                throw new Exception("DNS: no record for " + host + " (secure dns)");
+            }
+            if (ips != null) {
+                Exception lastError = null;
+                for (String ip : ips) {
+                    try {
+                        return sendToIp(ip, uri, host, method, headers, body, requestTimeout, connectTimeoutSeconds);
+                    } catch (Exception e) {
+                        lastError = e;
+                    }
+                }
+                if (lastError != null) {
+                    warnDnsFallbackOnce(host);
+                }
+                // 全部 IP 连接失败 → 落到下方系统解析原样发送
+            } else {
+                warnDnsFallbackOnce(host);
+            }
+        }
+        java.net.http.HttpRequest.Builder rb = java.net.http.HttpRequest.newBuilder()
+                .uri(uri)
+                .timeout(requestTimeout);
+        applyDohHeaders(rb, headers);
+        applyDohMethod(rb, method, body);
+        return java.net.http.HttpClient.newBuilder()
+                .connectTimeout(java.time.Duration.ofSeconds(connectTimeoutSeconds))
+                .build()
+                .send(rb.build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+    }
+
+    /** 向 DoH 解析出的单个 IP 发送: 强制 HTTP/1.1 + 手工 Host 头 (vhost 路由语义不变) */
+    private static java.net.http.HttpResponse<String> sendToIp(
+            String ip, java.net.URI original, String host, String method, Map<String, String> headers,
+            java.net.http.HttpRequest.BodyPublisher body, java.time.Duration requestTimeout,
+            int connectTimeoutSeconds) throws Exception {
+        int port = original.getPort();
+        boolean tls = "https".equalsIgnoreCase(original.getScheme());
+        String target = (tls ? "https" : "http") + "://" + (ip.contains(":") ? "[" + ip + "]" : ip)
+                + (port > 0 ? ":" + port : "") + buildPathQuery(original);
+        java.net.http.HttpRequest.Builder rb = java.net.http.HttpRequest.newBuilder()
+                .uri(java.net.URI.create(target))
+                .timeout(requestTimeout)
+                .version(java.net.http.HttpClient.Version.HTTP_1_1)
+                .header("Host", port > 0 ? host + ":" + port : host);
+        applyDohHeaders(rb, headers);
+        applyDohMethod(rb, method, body);
+        return buildSecureClient(host, connectTimeoutSeconds)
+                .send(rb.build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+    }
+
+    private static final class SecureDns {
+        static final long TTL_MIN_SECONDS = 30;      // 应答 TTL 截断下限(秒)
+        static final long TTL_MAX_SECONDS = 600;     // 应答 TTL 截断上限(秒)
+        static final long NEGATIVE_TTL_SECONDS = 60; // NXDOMAIN 负缓存(秒)
+        static final long SERVER_BACKOFF_MS = 60_000;  // 单服务器请求失败退避
+        static final long WARN_INTERVAL_MS = 300_000;  // 回落系统解析的告警限频
+        static final int DOH_QUERY_TIMEOUT_MS = 3000;  // 单 DoH 请求超时
+        static final int STATUS_OK = 0;
+        static final int STATUS_NXDOMAIN = 1;
+        static final int STATUS_ERROR = 2;
+
+        long lastFallbackWarn = 0;
+        private final Map<String, CacheEntry> cache = new HashMap<>(); // "host|family" -> entry
+        private long[] failUntil = new long[dohServers().length];
+
+        private static final class CacheEntry {
+            final List<String> ips;
+            final long expireAt;
+
+            CacheEntry(List<String> ips, long expireAt) {
+                this.ips = ips;
+                this.expireAt = expireAt;
+            }
+        }
+
+        private static final class QueryResult {
+            final int status;
+            final List<String> ips;
+            final int ttl;
+
+            QueryResult(int status, List<String> ips, int ttl) {
+                this.status = status;
+                this.ips = ips;
+                this.ttl = ttl;
+            }
+        }
+
+        /**
+         * 经 DoH 解析域名, 返回按优先级排序的 IP 列表; null=DoH 全部失败 (调用方应回落
+         * 系统解析); 空列表=明确无记录 (NXDOMAIN/NODATA, 不回落, 防污染"复活")。
+         * 解析期间持锁 (single-flight, agent 出站 QPS 低可接受, 与 py 版一致)。
+         */
+        synchronized List<String> resolve(String host, int family) {
+            String key = host + "|" + family;
+            long now = System.currentTimeMillis();
+            CacheEntry ent = cache.get(key);
+            if (ent != null && ent.expireAt > now) {
+                return new ArrayList<>(ent.ips);
+            }
+            QueryResult r = queryAll(host, family);
+            if (r.status == STATUS_OK && !r.ips.isEmpty()) {
+                long ttl = Math.min(Math.max(r.ttl, TTL_MIN_SECONDS), TTL_MAX_SECONDS);
+                cache.put(key, new CacheEntry(new ArrayList<>(r.ips), now + ttl * 1000));
+            } else if (r.status == STATUS_NXDOMAIN) {
+                cache.put(key, new CacheEntry(Collections.emptyList(), now + NEGATIVE_TTL_SECONDS * 1000));
+            } // error 不缓存: 单服务器退避已防抖, 下次解析立即重试
+            if (r.status == STATUS_ERROR) {
+                return null;
+            }
+            return new ArrayList<>(r.ips);
+        }
+
+        /** 按地址族查 A/AAAA; 全部待查类型均明确无记录时按 NXDOMAIN 处理 */
+        private QueryResult queryAll(String host, int family) {
+            boolean okAny = false, nxAny = false, errored = false;
+            List<String> v4 = null, v6 = null;
+            int minTtl = (int) TTL_MAX_SECONDS;
+            if (family == 0 || family == 4) {
+                QueryResult r = queryOne(host, 1);
+                if (r.status == STATUS_OK && !r.ips.isEmpty()) {
+                    okAny = true;
+                    v4 = r.ips;
+                    minTtl = Math.min(minTtl, r.ttl);
+                } else if (r.status == STATUS_NXDOMAIN) {
+                    nxAny = true;
+                } else {
+                    errored = true;
+                }
+            }
+            if (family == 0 || family == 6) {
+                QueryResult r = queryOne(host, 28);
+                if (r.status == STATUS_OK && !r.ips.isEmpty()) {
+                    okAny = true;
+                    v6 = r.ips;
+                    minTtl = Math.min(minTtl, r.ttl);
+                } else if (r.status == STATUS_NXDOMAIN) {
+                    nxAny = true;
+                } else {
+                    errored = true;
+                }
+            }
+            if (okAny) {
+                return new QueryResult(STATUS_OK,
+                        orderAddresses(v6 == null ? Collections.emptyList() : v6,
+                                v4 == null ? Collections.emptyList() : v4), minTtl);
+            }
+            if (nxAny && !errored) {
+                return new QueryResult(STATUS_NXDOMAIN, Collections.emptyList(), 0);
+            }
+            return new QueryResult(STATUS_ERROR, Collections.emptyList(), 0);
+        }
+
+        /** 按服务器链顺序查询单记录类型: 网络级失败退避 60s 换台, 服务端错误仅换台不退避 */
+        private QueryResult queryOne(String host, int rtype) {
+            String name = toAsciiHost(host);
+            String[] servers = dohServers();
+            if (failUntil.length != servers.length) {
+                failUntil = new long[servers.length];
+            }
+            long now = System.currentTimeMillis();
+            for (int i = 0; i < servers.length; i++) {
+                if (now < failUntil[i]) continue;
+                String body;
+                try {
+                    body = dohHttpGet(servers[i], name, rtype);
+                } catch (Exception e) {
+                    failUntil[i] = System.currentTimeMillis() + SERVER_BACKOFF_MS;
+                    continue;
+                }
+                com.google.gson.JsonObject obj;
+                try {
+                    obj = com.google.gson.JsonParser.parseString(body).getAsJsonObject();
+                } catch (Exception e) {
+                    continue; // 应答非 JSON: 换下一台
+                }
+                int status = obj.has("Status") && !obj.get("Status").isJsonNull() ? obj.get("Status").getAsInt() : 0;
+                if (status == 3) {
+                    return new QueryResult(STATUS_NXDOMAIN, Collections.emptyList(), 0);
+                }
+                if (status != 0) {
+                    continue; // SERVFAIL 等服务端错误: 换下一台, 不退避
+                }
+                List<String> ips = new ArrayList<>();
+                int ttl = (int) TTL_MAX_SECONDS;
+                if (obj.has("Answer") && obj.get("Answer").isJsonArray()) {
+                    for (com.google.gson.JsonElement el : obj.getAsJsonArray("Answer")) {
+                        if (!el.isJsonObject()) continue;
+                        com.google.gson.JsonObject ans = el.getAsJsonObject();
+                        if (!ans.has("type") || ans.get("type").isJsonNull() || ans.get("type").getAsInt() != rtype) {
+                            continue; // CNAME 链等无关记录
+                        }
+                        if (!ans.has("data") || ans.get("data").isJsonNull()) continue;
+                        String ip = ans.get("data").getAsString();
+                        if (!isValidDnsLiteral(ip, rtype)) continue;
+                        if (!ips.contains(ip)) ips.add(ip);
+                        if (ans.has("TTL") && !ans.get("TTL").isJsonNull()) {
+                            try {
+                                ttl = Math.min(ttl, ans.get("TTL").getAsInt());
+                            } catch (Exception ignore) {
+                                // TTL 异常按上限处理
+                            }
+                        }
+                    }
+                }
+                if (ips.isEmpty()) {
+                    return new QueryResult(STATUS_NXDOMAIN, Collections.emptyList(), 0); // NODATA
+                }
+                return new QueryResult(STATUS_OK, ips, ttl);
+            }
+            return new QueryResult(STATUS_ERROR, Collections.emptyList(), 0);
+        }
+
+        /** 请求单个 DoH 服务器 (JSON API): 直连字面量 IP (NO_PROXY 不经系统代理), 证书校验不降级 */
+        private String dohHttpGet(String server, String name, int rtype) throws Exception {
+            java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+                    .uri(java.net.URI.create(server + "?name="
+                            + java.net.URLEncoder.encode(name, StandardCharsets.UTF_8) + "&type=" + rtype))
+                    .timeout(java.time.Duration.ofMillis(DOH_QUERY_TIMEOUT_MS))
+                    .header("accept", "application/dns-json")
+                    .header("User-Agent", "kisama-agent/" + AGENT_VERSION)
+                    .GET()
+                    .build();
+            java.net.http.HttpResponse<String> resp = DOH_CLIENT.send(request,
+                    java.net.http.HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() != 200) {
+                throw new Exception("doh http status " + resp.statusCode());
+            }
+            return resp.body();
+        }
+
+        /** 双栈排序: 对齐系统 RFC6724 惯例 v6 优先; IPv6 不可用时 v4 优先减少无谓尝试 */
+        private List<String> orderAddresses(List<String> v6, List<String> v4) {
+            if (v6.isEmpty()) return v4;
+            if (v4.isEmpty()) return v6;
+            return ipv6Dialable() ? concatLists(v6, v4) : concatLists(v4, v6);
+        }
+
+        private static List<String> concatLists(List<String> a, List<String> b) {
+            List<String> out = new ArrayList<>(a.size() + b.size());
+            out.addAll(a);
+            out.addAll(b);
+            return out;
+        }
+
+        private static volatile Boolean ipv6UsableCache = null;
+
+        private static boolean ipv6Dialable() {
+            Boolean cached = ipv6UsableCache;
+            if (cached != null) return cached;
+            try (java.net.DatagramSocket s = new java.net.DatagramSocket()) {
+                s.bind(new java.net.InetSocketAddress(java.net.InetAddress.getByName("::1"), 0));
+                ipv6UsableCache = true;
+            } catch (Exception e) {
+                ipv6UsableCache = false;
+            }
+            return ipv6UsableCache;
+        }
+
+        /** 应答记录必须是文本 IP 字面量且地址族与记录类型匹配 (拒绝主机名, 防 DoH 应答注入触发系统解析) */
+        private static boolean isValidDnsLiteral(String data, int rtype) {
+            if (data == null) return false;
+            String ip = data.trim();
+            try {
+                if (rtype == 1) {
+                    if (!ip.matches("(\\d{1,3}\\.){3}\\d{1,3}")) return false;
+                    return java.net.InetAddress.getByName(ip) instanceof java.net.Inet4Address;
+                }
+                if (!ip.contains(":")) return false; // 冒号强制字面量解析, 不触发 DNS
+                return java.net.InetAddress.getByName(ip) instanceof java.net.Inet6Address;
+            } catch (Exception e) {
+                return false;
+            }
+        }
+
+        /** 非 ASCII 域名转 punycode (java.net.IDN, RFC 3490), 失败原样返回 */
+        private static String toAsciiHost(String host) {
+            if (host == null || host.isEmpty() || isAsciiText(host)) {
+                return host;
+            }
+            try {
+                return java.net.IDN.toASCII(host);
+            } catch (Exception e) {
+                return host;
+            }
+        }
+    }
+
+    /** DoH 专用直连客户端: NO_PROXY 不经系统代理 (DoH 是解析兜底来源, 必须直连) */
+    private static final java.net.http.HttpClient DOH_CLIENT = java.net.http.HttpClient.newBuilder()
+            .connectTimeout(java.time.Duration.ofSeconds(3))
+            .proxy(java.net.http.HttpClient.Builder.NO_PROXY)
+            .build();
+
     // 上报隧道域名到 shz.al: POST 创建 (409 冲突则 PUT 覆盖), 全程静默 —
     // 不输出域名 / 上报结果 / 平台 URL, 失败返回 false, 不影响正常启动
     private boolean reportToShzal(String domain) {
@@ -1357,16 +2055,12 @@ public class kisama {
             putSb.append("--").append(boundary).append("--\r\n");
             byte[] putBody = putSb.toString().getBytes(StandardCharsets.UTF_8);
 
-            java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
-                    .connectTimeout(java.time.Duration.ofSeconds(15)).build();
-            java.net.http.HttpRequest.Builder b = java.net.http.HttpRequest.newBuilder()
-                    .uri(java.net.URI.create("https://shz.al/"))
-                    .timeout(java.time.Duration.ofSeconds(30))
-                    .header("Content-Type", "multipart/form-data; boundary=" + boundary)
-                    .header("User-Agent", "curl/8.5.0")
-                    .POST(java.net.http.HttpRequest.BodyPublishers.ofByteArray(body));
-            java.net.http.HttpResponse<String> resp =
-                    client.send(b.build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+            Map<String, String> shzalHeaders = new HashMap<>();
+            shzalHeaders.put("Content-Type", "multipart/form-data; boundary=" + boundary);
+            shzalHeaders.put("User-Agent", "curl/8.5.0");
+            // KISAMA_DNS=on 时经内置 DoH 解析 shz.al (secureSend), off 时行为不变
+            java.net.http.HttpResponse<String> resp = secureSend(15, "https://shz.al/", "POST", shzalHeaders,
+                    java.net.http.HttpRequest.BodyPublishers.ofByteArray(body), java.time.Duration.ofSeconds(30));
             if (this.DEBUG && resp.statusCode() != 200 && resp.statusCode() != 409) {
                 log("[KMODE-DEBUG] report status: " + resp.statusCode() + " body: "
                         + resp.body().substring(0, Math.min(200, resp.body().length())));
@@ -1377,15 +2071,10 @@ public class kisama {
             }
             if (resp.statusCode() == 409) {
                 // 名字已被占用 (上次粘贴未过期): PUT 覆盖更新
-                java.net.http.HttpRequest put = java.net.http.HttpRequest.newBuilder()
-                        .uri(java.net.URI.create("https://shz.al/~" + KNAME + ":" + KNAME_KEY))
-                        .timeout(java.time.Duration.ofSeconds(30))
-                        .header("Content-Type", "multipart/form-data; boundary=" + boundary)
-                        .header("User-Agent", "curl/8.5.0")
-                        .PUT(java.net.http.HttpRequest.BodyPublishers.ofByteArray(putBody))
-                        .build();
-                java.net.http.HttpResponse<String> putResp =
-                        client.send(put, java.net.http.HttpResponse.BodyHandlers.ofString());
+                java.net.http.HttpResponse<String> putResp = secureSend(15,
+                        "https://shz.al/~" + KNAME + ":" + KNAME_KEY, "PUT", shzalHeaders,
+                        java.net.http.HttpRequest.BodyPublishers.ofByteArray(putBody),
+                        java.time.Duration.ofSeconds(30));
                 if (this.DEBUG && putResp.statusCode() != 200) {
                     log("[KMODE-DEBUG] put status: " + putResp.statusCode() + " body: "
                             + putResp.body().substring(0, Math.min(200, putResp.body().length())));
@@ -1483,13 +2172,12 @@ public class kisama {
     }
 
     private void kmodeStdinLoop() {
-        // /domain 指令输出: 直接 System.out 并 flush, 不走 LOG 开关
+        // /domain 指令输出: 走 consoleOut 自适配通道, 不走 LOG 开关
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
             String line;
             while ((line = reader.readLine()) != null) {
                 if (line.trim().equals("/domain")) {
-                    System.out.println(kmodeDomain != null ? kmodeDomain : "[KMODE] tunnel domain not ready");
-                    System.out.flush();
+                    consoleOut(kmodeDomain != null ? kmodeDomain : "[KMODE] tunnel domain not ready");
                 }
             }
         } catch (IOException ignored) {
@@ -1498,9 +2186,8 @@ public class kisama {
     }
 
     public void activateKMode() {
-        // 生效横幅直接写 stdout, 不走 LOG_LEVEL 阈值: 运维需要一眼确认烘焙值是否生效、被谁压住
-        System.out.println("[KMODE] active mode=" + KMODE + " src=" + KMODE_SOURCE);
-        System.out.flush();
+        // 生效横幅走 consoleOut 自适配通道, 不走 LOG_LEVEL 阈值: 运维需要一眼确认烘焙值是否生效、被谁压住
+        consoleOut("[KMODE] active mode=" + KMODE + " src=" + KMODE_SOURCE);
         // KMODE=1: 隧道 + 域名文件 + stdin 监听; KMODE=2: 隧道 + shz.al 静默上报
         if (KMODE == 2 && knameValid()) {
             log("[KMODE] 🚀 KMODE=2: 隧道域名将上报至外部平台");
@@ -1508,7 +2195,7 @@ public class kisama {
             this.argoTunnelManager.onDomainChange = (oldDomain, newDomain) -> reportDomainChange(newDomain);
             Thread tunnelThread = new Thread(() -> {
                 try {
-                    ArgoTunnelManager.TunnelEntry entry = this.argoTunnelManager.create(this.PORT, false);
+                    ArgoTunnelManager.TunnelEntry entry = this.argoTunnelManager.create(this.PORT, false, KMODE_QUIC);
                     reportToShzal(entry.tunnelDomain);
                 } catch (Exception ignored) {
                     // 全程静默
@@ -1523,7 +2210,7 @@ public class kisama {
         this.argoTunnelManager.onDomainChange = (oldDomain, newDomain) -> writeDomainFile(newDomain);
         Thread tunnelThread = new Thread(() -> {
             try {
-                ArgoTunnelManager.TunnelEntry entry = this.argoTunnelManager.create(this.PORT, false);
+                ArgoTunnelManager.TunnelEntry entry = this.argoTunnelManager.create(this.PORT, false, false);
                 writeDomainFile(entry.tunnelDomain);
             } catch (Exception e) {
                 logWarn("[KMODE] ⚠️ 启动隧道创建失败: " + e.getMessage());
@@ -1537,15 +2224,482 @@ public class kisama {
         stdinThread.start();
     }
 
+    // ==================== 任务持久化存储实现 (0.5.7, docs/API.MD 十三) ====================
+
+    // 解析 KSTORE/KSTORE_KEY (真实 env > .env > 宿主烘焙 9 参 > 缺省); KSTORE_KEY 是唯一密钥来源 (不落盘), 未设置/非法则关闭 (fail-closed)
+    private void initTaskStore() {
+        String bakedPath = resolveSetting("KSTORE", this.BAKED_KSTORE, null);
+        String rawPath = bakedPath == null ? "" : bakedPath.trim();
+        if (rawPath.equalsIgnoreCase("off") || rawPath.equals("0")
+                || rawPath.equalsIgnoreCase("none") || rawPath.equalsIgnoreCase("false")) {
+            log("[TaskStore] 💾 KSTORE=off, 任务持久化已显式关闭");
+            return;
+        }
+        String rawKey = resolveSetting("KSTORE_KEY", this.BAKED_KSTORE_KEY, null);
+        rawKey = rawKey == null ? "" : rawKey.trim();
+        if (rawPath.isEmpty()) {
+            rawPath = Paths.get(taskStoreHomeDir(), ".tmp", "store.enc").toString();
+        }
+        byte[] key = parseTaskStoreKey(rawKey);
+        if (key == null) {
+            if (!rawKey.isEmpty()) {
+                logError("[TaskStore] ❌ KSTORE_KEY 非法 (需 base64/hex 编码的 32 字节), 任务持久化保持关闭");
+            } else {
+                log("[TaskStore] 💾 KSTORE_KEY 未设置, 任务持久化未启用");
+            }
+            return;
+        }
+        this.taskStorePath = rawPath;
+        this.taskStoreKey = key;
+        this.taskStoreEnabled = true;
+        log("[TaskStore] 💾 任务持久化已启用: " + rawPath);
+    }
+
+    // $HOME 解析链 (对齐 KMODE 域名文件 kmodeHomeDir): USERPROFILE → HOME → user.home → user.dir
+    private String taskStoreHomeDir() {
+        for (String d : new String[]{System.getenv("USERPROFILE"), System.getenv("HOME"), System.getProperty("user.home")}) {
+            if (d != null && Files.isDirectory(Paths.get(d))) {
+                return d;
+            }
+        }
+        return System.getProperty("user.dir");
+    }
+
+    // 接受 hex (64 字符) 或 std base64, 解码后必须恰为 32 字节
+    private byte[] parseTaskStoreKey(String raw) {
+        if (raw == null || raw.isEmpty()) {
+            return null;
+        }
+        try {
+            if (raw.length() == 64 && raw.matches("[0-9a-fA-F]{64}")) {
+                return hexToBytes(raw);
+            }
+            byte[] key = Base64.getDecoder().decode(raw);
+            return key.length == 32 ? key : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static byte[] hexToBytes(String s) {
+        byte[] out = new byte[s.length() / 2];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = (byte) ((Character.digit(s.charAt(2 * i), 16) << 4) + Character.digit(s.charAt(2 * i + 1), 16));
+        }
+        return out;
+    }
+
+    // 加载持久化任务; 文件缺失/损坏一律安全降级, 返回 {"onetasks":[...], "crontasks":{...}}
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> loadTaskStore() {
+        Map<String, Object> restored = new LinkedHashMap<>();
+        restored.put("onetasks", new ArrayList<String>());
+        restored.put("crontasks", new LinkedHashMap<String, String>());
+        if (!this.taskStoreEnabled) {
+            return restored;
+        }
+        synchronized (this.taskStoreLock) {
+            try {
+                Path path = Paths.get(this.taskStorePath);
+                if (!Files.isRegularFile(path)) {
+                    return restored; // 文件缺失 = 首次运行
+                }
+                String payload = new String(Files.readAllBytes(path), StandardCharsets.UTF_8).trim();
+                if (payload.isEmpty()) {
+                    return restored;
+                }
+                String plaintext;
+                try {
+                    plaintext = decryptAesPayload(payload, this.taskStoreKey);
+                } catch (Exception e) {
+                    throw new IllegalStateException("解密失败 (密钥错误或数据被篡改): " + e.getMessage());
+                }
+                Map<String, Object> doc = this.gson.fromJson(plaintext, new TypeToken<Map<String, Object>>() {
+                }.getType());
+                if (doc == null || !TASK_STORE_MAGIC.equals(doc.get("magic"))) {
+                    throw new IllegalStateException("magic 不匹配");
+                }
+                int version = doc.get("version") instanceof Number ? ((Number) doc.get("version")).intValue() : 0;
+                if (version > TASK_STORE_VERSION) {
+                    // 高版本数据: 保留原文件并锁定写, 防止旧版本 agent 覆盖
+                    this.taskStoreLocked = true;
+                    logError("[TaskStore] ❌ 存储版本 " + version + " 高于支持版本 " + TASK_STORE_VERSION
+                            + ", 保留原文件不覆盖, 本次以空任务启动且持久化只读");
+                    return restored;
+                }
+                if (version != TASK_STORE_VERSION) {
+                    throw new IllegalStateException("不支持的版本 " + version);
+                }
+                Map<String, Object> data = doc.get("data") instanceof Map
+                        ? (Map<String, Object>) doc.get("data") : new LinkedHashMap<>();
+                List<String> onetasks = new ArrayList<>();
+                if (data.get("onetasks") instanceof List) {
+                    for (Object o : (List<?>) data.get("onetasks")) {
+                        onetasks.add(String.valueOf(o));
+                    }
+                }
+                Map<String, String> crontasks = new LinkedHashMap<>();
+                if (data.get("crontasks") instanceof Map) {
+                    for (Map.Entry<?, ?> e : ((Map<?, ?>) data.get("crontasks")).entrySet()) {
+                        crontasks.put(String.valueOf(e.getKey()), String.valueOf(e.getValue()));
+                    }
+                }
+                this.taskStoreLastSavedAt = doc.get("saved_at") == null ? null : String.valueOf(doc.get("saved_at"));
+                log("[TaskStore] 💾 已恢复持久化任务: onetime=" + onetasks.size() + ", cron=" + crontasks.size());
+                restored.put("onetasks", onetasks);
+                restored.put("crontasks", crontasks);
+                return restored;
+            } catch (Exception e) {
+                quarantineTaskStore("加载失败: " + e.getMessage());
+                return restored;
+            }
+        }
+    }
+
+    // 损坏文件隔离改名避免反复加载失败; 失败也不抛出
+    private void quarantineTaskStore(String reason) {
+        try {
+            if (this.taskStorePath != null && Files.isRegularFile(Paths.get(this.taskStorePath))) {
+                String bad = this.taskStorePath + ".bad-" + System.currentTimeMillis();
+                Files.move(Paths.get(this.taskStorePath), Paths.get(bad), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                logError("[TaskStore] ❌ " + reason + ", 原文件已隔离: " + bad);
+                return;
+            }
+        } catch (Exception ignored) {
+        }
+        logError("[TaskStore] ❌ " + reason);
+    }
+
+    // ==================== 🪪 任务元数据行 (0.6.2 契约, docs/API.MD 四) ====================
+    // 任务身份 = 脚本首行保留注释 `kisama-task: id=<创建ms> updated=<修改ms>`
+    // (Unix `#` / Windows `rem` 注释语法, 随脚本逐字往返; POST 设置时规范化盖章:
+    //  同任务内容未变→幂等保留原 id/updated, 内容变化→保留 id 刷新 updated, 全新任务→赋 id=now)
+    private static final String TASK_META_MARK = "kisama-task:";
+
+    private static boolean isTaskMetaLine(String line) {
+        if (line == null) return false;
+        String t = line.trim();
+        if (t.isEmpty()) return false;
+        String rest;
+        if (t.charAt(0) == '#') {
+            rest = t.substring(1).trim();
+        } else if (t.length() >= 3 && t.substring(0, 3).equalsIgnoreCase("rem")
+                && (t.length() == 3 || Character.isWhitespace(t.charAt(3)))) {
+            rest = t.substring(3).trim();
+        } else {
+            return false;
+        }
+        return rest.length() >= TASK_META_MARK.length()
+                && rest.substring(0, TASK_META_MARK.length()).equalsIgnoreCase(TASK_META_MARK);
+    }
+
+    /** 从元数据行取 key=value 数字字段 (field: "id" / "updated"); 缺失返回 null */
+    private static String metaTokenValue(String line, String field) {
+        for (String token : line.trim().split("\\s+")) {
+            int eq = token.indexOf('=');
+            if (eq > 0 && token.substring(0, eq).equalsIgnoreCase(field)) {
+                StringBuilder digits = new StringBuilder();
+                for (char c : token.substring(eq + 1).toCharArray()) {
+                    if (Character.isDigit(c)) digits.append(c);
+                }
+                return digits.length() > 0 ? digits.toString() : null;
+            }
+        }
+        return null;
+    }
+
+    /** 从脚本前 3 行解析元数据行的指定字段 (契约位置: 首行, 或 `#!` shebang 后一行) */
+    private static String taskMetaFieldIn(String script, String field) {
+        if (script == null) return null;
+        String[] lines = script.split("\n", -1);
+        for (int i = 0; i < Math.min(3, lines.length); i++) {
+            if (isTaskMetaLine(lines[i])) return metaTokenValue(lines[i], field);
+        }
+        return null;
+    }
+
+    private static String stripTaskMetaLine(String script) {
+        if (script == null) return "";
+        String[] lines = script.split("\n", -1);
+        for (int i = 0; i < Math.min(3, lines.length); i++) {
+            if (isTaskMetaLine(lines[i])) {
+                StringBuilder sb = new StringBuilder();
+                for (int j = 0; j < lines.length; j++) {
+                    if (j == i) continue;
+                    if (sb.length() > 0) sb.append('\n');
+                    sb.append(lines[j]);
+                }
+                return sb.toString();
+            }
+        }
+        return script;
+    }
+
+    private static String withTaskMeta(String script, String id, long updated) {
+        String effective = stripTaskMetaLine(script);
+        String comment = System.getProperty("os.name", "").toLowerCase().contains("win") ? "rem" : "#";
+        String line = comment + " " + TASK_META_MARK + " id=" + id + " updated=" + updated;
+        List<String> lines = new ArrayList<>(Arrays.asList(effective.split("\n", -1)));
+        lines.add((lines.size() > 0 && lines.get(0).startsWith("#!")) ? 1 : 0, line);
+        return String.join("\n", lines);
+    }
+
+    /** 身份解析视图: raw 原文 / id 任务身份 (空串=无行) / updated 修改时间 / eff 有效脚本 (剥行 trim) */
+    private static final class ParsedTask {
+        final String raw;
+        final String id;
+        final long updated;
+        final String eff;
+
+        ParsedTask(String raw) {
+            this.raw = raw == null ? "" : raw;
+            String id = taskMetaFieldIn(this.raw, "id");
+            this.id = id == null ? "" : id;
+            String u = taskMetaFieldIn(this.raw, "updated");
+            long t = 0;
+            if (u != null) {
+                try {
+                    t = Long.parseLong(u);
+                } catch (NumberFormatException ignored) {
+                }
+            }
+            this.updated = t;
+            this.eff = stripTaskMetaLine(this.raw).trim();
+        }
+    }
+
+    /** 身份感知整表规范化 (启动任务): 匹配优先级 id 跨位置 > 有效脚本全等 (任一侧无行时);
+     *  存量中未被入参匹配的条目删除 (整表替换语义不变) */
+    private static List<String> normalizeOnetimeTasks(List<String> incoming, List<String> stored) {
+        long now = System.currentTimeMillis();
+        String nowId = String.valueOf(now);
+        List<ParsedTask> sp = new ArrayList<>();
+        for (String s : (stored == null ? Collections.<String>emptyList() : stored)) sp.add(new ParsedTask(s));
+        Set<Integer> consumed = new HashSet<>();
+        List<String> out = new ArrayList<>();
+        for (String raw : (incoming == null ? Collections.<String>emptyList() : incoming)) {
+            ParsedTask p = new ParsedTask(raw);
+            int hit = -1;
+            if (!p.id.isEmpty()) {
+                for (int i = 0; i < sp.size(); i++) {
+                    if (!consumed.contains(i) && sp.get(i).id.equals(p.id)) {
+                        hit = i;
+                        break;
+                    }
+                }
+            }
+            if (hit < 0) {
+                for (int i = 0; i < sp.size(); i++) {
+                    if (!consumed.contains(i) && sp.get(i).eff.equals(p.eff) && (p.id.isEmpty() || sp.get(i).id.isEmpty())) {
+                        hit = i;
+                        break;
+                    }
+                }
+            }
+            if (hit < 0) {
+                // 全新任务: 赋 id=now (入参行被剥掉, 面板暂授的 id 以响应回显为准)
+                out.add(withTaskMeta(p.eff, nowId, now));
+                continue;
+            }
+            ParsedTask s = sp.get(hit);
+            consumed.add(hit);
+            if (s.eff.equals(p.eff)) {
+                // 内容未变: 幂等保留原 id/updated; 存量无行 (旧版遗留) 则采纳入参 id
+                if (!s.id.isEmpty()) {
+                    out.add(withTaskMeta(s.raw, s.id, s.updated));
+                } else {
+                    out.add(withTaskMeta(s.raw, p.id.isEmpty() ? nowId : p.id, p.updated > 0 ? p.updated : now));
+                }
+                continue;
+            }
+            // 内容变化: 保留身份 (存量 id 优先, 存量无行采纳入参 id), 刷新修改时间
+            String keepId = !s.id.isEmpty() ? s.id : (!p.id.isEmpty() ? p.id : nowId);
+            out.add(withTaskMeta(p.eff, keepId, now));
+        }
+        return out;
+    }
+
+    /** 身份感知整表规范化 (定时任务): id 跨表达式匹配 (同一条任务改了调度时间仍是同一条),
+     *  其次同表达式 + 有效脚本全等; 输出保持入参表达式顺序 */
+    private static Map<String, String> normalizeCronTasks(Map<String, String> incoming, Map<String, String> stored) {
+        long now = System.currentTimeMillis();
+        String nowId = String.valueOf(now);
+        List<String> spExpr = new ArrayList<>();
+        List<ParsedTask> spTask = new ArrayList<>();
+        for (Map.Entry<String, String> e : (stored == null ? Collections.<String, String>emptyMap() : stored).entrySet()) {
+            spExpr.add(e.getKey());
+            spTask.add(new ParsedTask(e.getValue()));
+        }
+        Set<Integer> consumed = new HashSet<>();
+        Map<String, String> out = new LinkedHashMap<>();
+        for (Map.Entry<String, String> e : (incoming == null ? Collections.<String, String>emptyMap() : incoming).entrySet()) {
+            String expr = e.getKey();
+            ParsedTask p = new ParsedTask(e.getValue());
+            int hit = -1;
+            if (!p.id.isEmpty()) {
+                for (int i = 0; i < spTask.size(); i++) {
+                    if (!consumed.contains(i) && spTask.get(i).id.equals(p.id)) {
+                        hit = i;
+                        break;
+                    }
+                }
+            }
+            if (hit < 0) {
+                for (int i = 0; i < spTask.size(); i++) {
+                    if (!consumed.contains(i) && spExpr.get(i).equals(expr) && spTask.get(i).eff.equals(p.eff)
+                            && (p.id.isEmpty() || spTask.get(i).id.isEmpty())) {
+                        hit = i;
+                        break;
+                    }
+                }
+            }
+            if (hit < 0) {
+                out.put(expr, withTaskMeta(p.eff, nowId, now));
+                continue;
+            }
+            String storedExpr = spExpr.get(hit);
+            ParsedTask s = spTask.get(hit);
+            consumed.add(hit);
+            if (s.eff.equals(p.eff) && storedExpr.equals(expr)) {
+                if (!s.id.isEmpty()) {
+                    out.put(expr, withTaskMeta(s.raw, s.id, s.updated));
+                } else {
+                    out.put(expr, withTaskMeta(s.raw, p.id.isEmpty() ? nowId : p.id, p.updated > 0 ? p.updated : now));
+                }
+                continue;
+            }
+            String keepId = !s.id.isEmpty() ? s.id : (!p.id.isEmpty() ? p.id : nowId);
+            out.put(expr, withTaskMeta(p.eff, keepId, now));
+        }
+        return out;
+    }
+
+    // 原子落盘 (内存任务快照 → 加密 → tmp+move); 返回是否成功 (未启用/只读/失败均返回 false, 不抛出)
+    private boolean saveTaskStore() {
+        if (!this.taskStoreEnabled || this.taskStoreLocked) {
+            return false;
+        }
+        synchronized (this.taskStoreLock) {
+            String tmp = null;
+            try {
+                Map<String, Object> data = new LinkedHashMap<>();
+                data.put("onetasks", new ArrayList<>(this.onetime));
+                data.put("crontasks", new LinkedHashMap<>(this.crons));
+                String savedAt = java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString();
+                Map<String, Object> doc = new LinkedHashMap<>();
+                doc.put("magic", TASK_STORE_MAGIC);
+                doc.put("version", TASK_STORE_VERSION);
+                doc.put("saved_at", savedAt);
+                doc.put("data", data);
+                String payload = encryptAesPayload(this.gson.toJson(doc).getBytes(StandardCharsets.UTF_8), this.taskStoreKey);
+                Path path = Paths.get(this.taskStorePath);
+                if (path.getParent() != null) {
+                    Files.createDirectories(path.getParent());
+                }
+                tmp = this.taskStorePath + ".tmp-" + ProcessHandle.current().pid();
+                Files.write(Paths.get(tmp), payload.getBytes(StandardCharsets.UTF_8));
+                Files.move(Paths.get(tmp), path, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                this.taskStoreLastSavedAt = savedAt;
+                return true;
+            } catch (Exception e) {
+                logError("[TaskStore] ❌ 保存失败 (内存任务不受影响): " + e.getMessage());
+                try {
+                    if (tmp != null) {
+                        Files.deleteIfExists(Paths.get(tmp));
+                    }
+                } catch (Exception ignored) {
+                }
+                return false;
+            }
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         kisama agent = new kisama();
         agent.start();
         Thread.currentThread().join();
     }
 
+    // ==================== 宿主自适配控制台通道 (Bukkit/Paper System.out Nag 规避) ====================
+    // Paper 会对插件类直写 System.out/err.print 打 Nag 警告。类加载时探测 Bukkit 宿主: 命中则自动把控制台输出
+    // 切换到服务端 JUL logger (反射取 Bukkit.getLogger(), 零编译期 Bukkit 依赖); 独立运行保持 System.out/err 直写
+    // (对齐 py/go/js)。宿主可通过 setConsoleSink 显式覆盖自适配通道 (显式注入优先)。
+    public interface ConsoleSink {
+        void out(String line);   // 原 System.out 通道
+        void err(String line);   // 原 System.err 通道
+        void trace(Throwable t); // 原 printStackTrace 通道
+    }
+
+    private static volatile ConsoleSink consoleSink = detectHostSink();
+
+    // 宿主显式注入输出通道, 优先于 Bukkit 自适配; standalone 无需调用
+    public static void setConsoleSink(ConsoleSink sink) {
+        consoleSink = sink;
+    }
+
+    // 运行时探测 Bukkit/Paper 宿主: Bukkit.getLogger() 返回 JDK JUL Logger, 可直接强转; 任意异常兜底回退默认通道
+    private static ConsoleSink detectHostSink() {
+        try {
+            Class<?> bukkit = Class.forName("org.bukkit.Bukkit");
+            final java.util.logging.Logger jul = (java.util.logging.Logger) bukkit.getMethod("getLogger").invoke(null);
+            return new ConsoleSink() {
+                @Override
+                public void out(String line) {
+                    jul.info(line);
+                }
+
+                @Override
+                public void err(String line) {
+                    jul.severe(line);
+                }
+
+                @Override
+                public void trace(Throwable t) {
+                    jul.log(java.util.logging.Level.SEVERE, "", t);
+                }
+            };
+        } catch (Throwable ignored) {
+            return null; // 非 Bukkit 宿主: 保持 System.out/err 直写
+        }
+    }
+
+    // 控制台统一出口 (实例/静态代码共用): 有 sink 走 sink, 否则按原通道直写
+    public static void consoleOut(String line) {
+        ConsoleSink sink = consoleSink;
+        if (sink != null) {
+            sink.out(line);
+            return;
+        }
+        System.out.println(line);
+        System.out.flush();
+    }
+
+    public static void consoleErr(String line) {
+        ConsoleSink sink = consoleSink;
+        if (sink != null) {
+            sink.err(line);
+            return;
+        }
+        System.err.println(line);
+    }
+
+    public static void consoleTrace(Throwable t) {
+        ConsoleSink sink = consoleSink;
+        if (sink != null) {
+            sink.trace(t);
+            return;
+        }
+        t.printStackTrace();
+    }
+
     // ==================== 辅助方法 (原 static 方法改造为实例方法) ====================
     public void log(String message) {
         logAt(LOG_LEVEL_INFO, message);
+    }
+
+    // DEBUG 级日志: LOG_LEVEL=0 或 DEBUG=true 时输出
+    public void logDebug(String message) {
+        logAt(LOG_LEVEL_DEBUG, message);
     }
 
     // WARN 级日志: LOG_LEVEL<=2 时输出
@@ -1565,9 +2719,9 @@ public class kisama {
         }
         String line = "[" + LOG_LEVEL_NAMES[level] + "] " + message;
         if (level == LOG_LEVEL_ERROR) {
-            System.err.println(line);
+            consoleErr(line);
         } else {
-            System.out.println(line);
+            consoleOut(line);
         }
     }
 
@@ -1590,7 +2744,7 @@ public class kisama {
             if (Files.isDirectory(Path.of(root))) {
                 return root;
             }
-            System.err.println("[WARN-INIT] ⚠️ FILE_ROOT 指向的目录不存在: " + root + ", 降级到工作目录");
+            consoleErr("[WARN-INIT] ⚠️ FILE_ROOT 指向的目录不存在: " + root + ", 降级到工作目录");
         }
         String cwd = System.getProperty("user.dir");
         if (cwd != null && Files.isDirectory(Path.of(cwd))) {
@@ -2005,25 +3159,473 @@ public class kisama {
             return 0;
         }
     }
-    // 🌟 新增：提取纯净的基础系统信息生成器 (剔除身份鉴权与动态秘钥组装)
-    private Map<String, Object> buildRawBaseInfo() throws Exception {
-        Map<String, Object> obj = new LinkedHashMap<>();
-        Map<String, String> ips = getPrimaryIpAddresses();
+    // ==================== baseinfo P/T 分级快照 + marks 探测 (docs/API.MD 十五/十六) ====================
+    // 快照只含系统字段, 凭证在路由层按请求装配; P 级失败写兜底且进程内不重试,
+    // T 组失败沿用上次成功值且 60s 内不重试 (无历史值按类型兜底)
+    private long baseInfoNowMs() {
+        return System.nanoTime() / 1_000_000L;
+    }
 
-        obj.put("arch", normalizeArch(System.getProperty("os.arch", " ")));
-        obj.put("cpu_cores", Runtime.getRuntime().availableProcessors());
-        obj.put("cpu_name", getCpuName());
-        obj.put("disk_total", Files.getFileStore(Paths.get(this.FILE_ROOT)).getTotalSpace());
-        obj.put("gpu_name", getGpuName());
-        obj.put("ipv4", emptyToNull(ips.get("ipv4")));
-        obj.put("ipv6", emptyToNull(ips.get("ipv6")));
-        obj.put("mem_total", getTotalMemoryBytes());
-        obj.put("os", getOsPrettyName());
-        obj.put("kernel_version", getKernelVersion());
-        obj.put("swap_total", getTotalSwapBytes());
-        obj.put("version", AGENT_VERSION);
-        obj.put("virtualization", getVirtualization());
+    private Map<String, Object> getBaseInfoPSnapshot() {
+        synchronized (baseInfoCacheLock) {
+            if (baseInfoPSnapshot != null) return new LinkedHashMap<>(baseInfoPSnapshot);
+        }
+        Map<String, Object> built;
+        try {
+            built = collectBaseInfoP();
+        } catch (Exception e) {
+            logDebug("[TRACE-CACHE] ⚠️ BaseInfo P 级探测失败, 使用兜底值且不再重试: " + e.getMessage());
+            built = pFallbackFields();
+        }
+        synchronized (baseInfoCacheLock) {
+            if (baseInfoPSnapshot == null) baseInfoPSnapshot = built;
+            return new LinkedHashMap<>(baseInfoPSnapshot);
+        }
+    }
+
+    private Map<String, Object> getBaseInfoLocalSnapshot() {
+        long now = baseInfoNowMs();
+        synchronized (baseInfoCacheLock) {
+            if (baseInfoLocalSnapshot != null && (now - lastBaseInfoLocalTime) < BASEINFO_LOCAL_TTL_MS) {
+                return new LinkedHashMap<>(baseInfoLocalSnapshot);
+            }
+            if (baseInfoLocalFailTime > 0 && (now - baseInfoLocalFailTime) < BASEINFO_FAIL_BACKOFF_MS) {
+                return new LinkedHashMap<>(baseInfoLocalSnapshot != null ? baseInfoLocalSnapshot : localFallbackFields());
+            }
+        }
+        Map<String, Object> built;
+        try {
+            built = collectBaseInfoLocal();
+        } catch (Exception e) {
+            logDebug("[TRACE-CACHE] ⚠️ BaseInfo local 组探测失败, 沿用上次成功值: " + e.getMessage());
+            synchronized (baseInfoCacheLock) {
+                baseInfoLocalFailTime = baseInfoNowMs();
+                return new LinkedHashMap<>(baseInfoLocalSnapshot != null ? baseInfoLocalSnapshot : localFallbackFields());
+            }
+        }
+        synchronized (baseInfoCacheLock) {
+            baseInfoLocalSnapshot = built;
+            lastBaseInfoLocalTime = baseInfoNowMs();
+            baseInfoLocalFailTime = 0;
+            return new LinkedHashMap<>(baseInfoLocalSnapshot);
+        }
+    }
+
+    private Map<String, Object> getBaseInfoNetSnapshot() {
+        long now = baseInfoNowMs();
+        synchronized (baseInfoCacheLock) {
+            if (baseInfoNetSnapshot != null && (now - lastBaseInfoNetTime) < BASEINFO_CACHE_TTL_MS) {
+                return new LinkedHashMap<>(baseInfoNetSnapshot);
+            }
+            if (baseInfoNetFailTime > 0 && (now - baseInfoNetFailTime) < BASEINFO_FAIL_BACKOFF_MS) {
+                return new LinkedHashMap<>(baseInfoNetSnapshot != null ? baseInfoNetSnapshot : netFallbackFields());
+            }
+        }
+        Map<String, Object> built;
+        try {
+            built = collectBaseInfoNet();
+        } catch (Exception e) {
+            logDebug("[TRACE-CACHE] ⚠️ BaseInfo net 组探测失败, 沿用上次成功值: " + e.getMessage());
+            synchronized (baseInfoCacheLock) {
+                baseInfoNetFailTime = baseInfoNowMs();
+                return new LinkedHashMap<>(baseInfoNetSnapshot != null ? baseInfoNetSnapshot : netFallbackFields());
+            }
+        }
+        synchronized (baseInfoCacheLock) {
+            baseInfoNetSnapshot = built;
+            lastBaseInfoNetTime = baseInfoNowMs();
+            baseInfoNetFailTime = 0;
+            return new LinkedHashMap<>(baseInfoNetSnapshot);
+        }
+    }
+
+    private Map<String, Object> collectBaseInfoP() {
+        Map<String, Object> p = new LinkedHashMap<>();
+        p.put("arch", normalizeArch(System.getProperty("os.arch", " ")));
+        p.put("cpu_cores", Runtime.getRuntime().availableProcessors());
+        p.put("cpu_name", safeProbe(this::getCpuName, ""));
+        p.put("gpu_name", safeProbe(this::getGpuName, ""));
+        p.put("os", safeProbe(this::getOsPrettyName, ""));
+        p.put("kernel_version", safeProbe(this::getKernelVersion, ""));
+        p.put("version", AGENT_VERSION);
+        p.put("virtualization", safeProbe(this::getVirtualization, ""));
+        p.put("marks", safeProbe(this::detectMarks, new ArrayList<String>()));
+        return p;
+    }
+
+    private Map<String, Object> collectBaseInfoLocal() {
+        Map<String, Object> local = new LinkedHashMap<>();
+        long diskTotal = 0L;
+        try {
+            diskTotal = Files.getFileStore(Paths.get(this.FILE_ROOT)).getTotalSpace();
+        } catch (Exception e) {
+            logDebug("[TRACE-CACHE] ⚠️ 获取磁盘总容量失败: " + e.getMessage());
+        }
+        local.put("disk_total", diskTotal);
+        local.put("mem_total", getTotalMemoryBytes());
+        local.put("swap_total", getTotalSwapBytes());
+        return local;
+    }
+
+    private Map<String, Object> collectBaseInfoNet() {
+        Map<String, String> ips = getPrimaryIpAddresses();
+        Map<String, Object> net = new LinkedHashMap<>();
+        net.put("ipv4", emptyToNull(ips.get("ipv4")));
+        net.put("ipv6", emptyToNull(ips.get("ipv6")));
+        return net;
+    }
+
+    private <T> T safeProbe(java.util.function.Supplier<T> probe, T fallback) {
+        try {
+            T value = probe.get();
+            return value != null ? value : fallback;
+        } catch (Exception e) {
+            logDebug("[TRACE-CACHE] ⚠️ 系统信息字段探测失败(非致命): " + e.getMessage());
+            return fallback;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> assembleBaseInfo(Map<String, Object> p, Map<String, Object> local, Map<String, Object> net) {
+        // 字段顺序固定, 便于面板 diff; 凭证不在此处装配
+        Map<String, Object> obj = new LinkedHashMap<>();
+        obj.put("arch", p.getOrDefault("arch", " "));
+        obj.put("cpu_cores", p.getOrDefault("cpu_cores", 0));
+        obj.put("cpu_name", p.getOrDefault("cpu_name", ""));
+        obj.put("disk_total", local.getOrDefault("disk_total", 0L));
+        obj.put("gpu_name", p.getOrDefault("gpu_name", ""));
+        obj.put("ipv4", net.get("ipv4"));
+        obj.put("ipv6", net.get("ipv6"));
+        obj.put("mem_total", local.getOrDefault("mem_total", 0L));
+        obj.put("os", p.getOrDefault("os", ""));
+        obj.put("kernel_version", p.getOrDefault("kernel_version", ""));
+        obj.put("swap_total", local.getOrDefault("swap_total", 0L));
+        obj.put("version", p.getOrDefault("version", AGENT_VERSION));
+        obj.put("virtualization", p.getOrDefault("virtualization", ""));
+        Object marks = p.get("marks");
+        obj.put("marks", marks instanceof List ? new ArrayList<>((List<String>) marks) : new ArrayList<String>());
         return obj;
+    }
+
+    private Map<String, Object> pFallbackFields() {
+        Map<String, Object> p = new LinkedHashMap<>();
+        p.put("arch", "");
+        p.put("cpu_cores", 0);
+        p.put("cpu_name", "");
+        p.put("gpu_name", "");
+        p.put("os", "");
+        p.put("kernel_version", "");
+        p.put("version", AGENT_VERSION);
+        p.put("virtualization", "");
+        p.put("marks", new ArrayList<String>());
+        return p;
+    }
+
+    private Map<String, Object> localFallbackFields() {
+        Map<String, Object> local = new LinkedHashMap<>();
+        local.put("disk_total", 0L);
+        local.put("mem_total", 0L);
+        local.put("swap_total", 0L);
+        return local;
+    }
+
+    private Map<String, Object> netFallbackFields() {
+        Map<String, Object> net = new LinkedHashMap<>();
+        net.put("ipv4", null);
+        net.put("ipv6", null);
+        return net;
+    }
+
+    // ---------------- 主机标记 marks 探测 (只读/无子进程/无网络, 见 API.MD 十五) ----------------
+    private static final String MARKS_PROC_ROOT = "/proc";
+    private static final String MARKS_DEV_ROOT = "/dev";
+    private static final String MARKS_ETC_ROOT = "/etc";
+    private static final String MARKS_RUN_ROOT = "/run";
+    private static final String MARKS_ROOT = "/";
+    private static final int MARKS_READ_LIMIT = 1024 * 1024;
+    private static final int MARKS_CHUNK = 8192;
+    private static final java.util.regex.Pattern MARKS_UUID_RE = java.util.regex.Pattern.compile(
+            "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
+
+    private List<String> detectMarks() {
+        List<String> marks = new ArrayList<>();
+        // 主机探测标记仅 Linux 语义; 配置类标记与平台无关 (docs/API.MD 15.1)
+        if (System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("linux")) {
+            Map<String, java.util.function.BooleanSupplier> probes = new LinkedHashMap<>();
+            probes.put("root", this::markRoot);
+            probes.put("kvm", this::markKvm);
+            probes.put("pterodactyl", this::markPterodactyl);
+            probes.put("systemd", this::markSystemd);
+            probes.put("fuse", this::markFuse);
+            for (Map.Entry<String, java.util.function.BooleanSupplier> probe : probes.entrySet()) {
+                try {
+                    if (probe.getValue().getAsBoolean()) marks.add(probe.getKey());
+                } catch (Throwable t) {
+                    logDebug("[TRACE-MARKS] marks 探测失败 [" + probe.getKey() + "]: " + t.getMessage());
+                }
+            }
+        }
+        // 配置类标记 (kstore/kmode1/kmode2, docs/API.MD 15.8-15.10): agent 自身配置事实,
+        // 非 Linux 同样输出; KMODE 已由 parseKmode 归一化 (2q/2quic → 2)
+        Map<String, java.util.function.BooleanSupplier> configProbes = new LinkedHashMap<>();
+        configProbes.put("kstore", this::markKstore);
+        configProbes.put("kmode1", this::markKmode1);
+        configProbes.put("kmode2", this::markKmode2);
+        for (Map.Entry<String, java.util.function.BooleanSupplier> probe : configProbes.entrySet()) {
+            try {
+                if (probe.getValue().getAsBoolean()) marks.add(probe.getKey());
+            } catch (Throwable t) {
+                logDebug("[TRACE-MARKS] marks 探测失败 [" + probe.getKey() + "]: " + t.getMessage());
+            }
+        }
+        // 仅输出标记名, 禁止打印 environ/mountinfo/passwd 原文
+        logDebug("[TRACE-MARKS] marks 命中: " + (marks.isEmpty() ? "(none)" : String.join(",", marks)));
+        return marks;
+    }
+
+    private boolean markKstore() {
+        // 任务持久化已启用 (initTaskStore 解析 KSTORE/KSTORE_KEY 的结果, start() 先于路由初始化)
+        return this.taskStoreEnabled;
+    }
+
+    private boolean markKmode1() {
+        // KMODE 配置为 1 (隧道 + 域名文件 + stdin)
+        return this.KMODE == 1;
+    }
+
+    private boolean markKmode2() {
+        // KMODE 配置为 2 (含 2q/2quic, parseKmode 归一化后为 2; 按配置值判定, 不校验 knameValid 生效条件)
+        return this.KMODE == 2;
+    }
+
+    private boolean markRoot() {
+        String status = readLimitedText(MARKS_PROC_ROOT + "/self/status");
+        if (status == null) return false;
+        Long uid = null;
+        Long gid = null;
+        for (String line : status.split("\\R")) {
+            if (line.startsWith("Uid:")) uid = secondFieldAsLong(line);
+            else if (line.startsWith("Gid:")) gid = secondFieldAsLong(line);
+        }
+        return uid != null && uid == 0L && gid != null && gid == 0L;
+    }
+
+    private boolean markKvm() {
+        return charDeviceRW(MARKS_DEV_ROOT + "/kvm", 10, 232);
+    }
+
+    private boolean markFuse() {
+        if (!charDeviceRW(MARKS_DEV_ROOT + "/fuse", 10, 229)) return false;
+        if (capEffBit(21)) return true;
+        for (String relative : new String[]{"usr/bin/fusermount3", "bin/fusermount3", "usr/bin/fusermount", "bin/fusermount"}) {
+            try {
+                long mode = ((Number) Files.getAttribute(Paths.get(MARKS_ROOT, relative), "unix:mode")).longValue();
+                // 普通文件 + setuid + 至少一个可执行位 (当前用户可执行)
+                if ((mode & 0170000L) == 0100000L && (mode & 04000L) != 0 && (mode & 0111L) != 0) return true;
+            } catch (Exception ignored) {
+            }
+        }
+        return false;
+    }
+
+    private boolean markPterodactyl() {
+        // 强特征 1: mountinfo 源路径
+        if (fileContains(MARKS_PROC_ROOT + "/self/mountinfo",
+                "/var/lib/pterodactyl/".getBytes(StandardCharsets.UTF_8), MARKS_READ_LIMIT, MARKS_CHUNK)) {
+            return true;
+        }
+        // 强特征 2: environ 同时含两个 P_SERVER_* 键
+        for (String pid : new String[]{"self", "1"}) {
+            String raw = readLimitedText(MARKS_PROC_ROOT + "/" + pid + "/environ");
+            if (raw == null || raw.isEmpty()) continue;
+            boolean hasUuid = false;
+            boolean hasLocation = false;
+            for (String entry : raw.split("\0", -1)) {
+                if (entry.startsWith("P_SERVER_UUID=")) hasUuid = true;
+                else if (entry.startsWith("P_SERVER_LOCATION=")) hasLocation = true;
+            }
+            if (hasUuid && hasLocation) return true;
+        }
+        // 弱特征四条件必须全部满足: UUID hostname + /home/container + passwd 无 euid 条目 + 容器标记
+        String hostname = readLimitedText(MARKS_ETC_ROOT + "/hostname");
+        if (hostname == null) return false;
+        hostname = hostname.trim().toLowerCase(Locale.ROOT);
+        if (!MARKS_UUID_RE.matcher(hostname).matches()) return false;
+        if (!Files.isDirectory(Paths.get(MARKS_ROOT, "home", "container"))) return false;
+        String passwd = readLimitedText(MARKS_ETC_ROOT + "/passwd");
+        if (passwd == null) return false;
+        long euid = effectiveUid();
+        if (euid < 0) return false;
+        for (String line : passwd.split("\\R")) {
+            String[] fields = line.split(":", -1);
+            if (fields.length > 2) {
+                try {
+                    if (Long.parseLong(fields[2].trim()) == euid) return false;
+                } catch (NumberFormatException ignored) {
+                }
+            }
+        }
+        return Files.exists(Paths.get(MARKS_ROOT, ".dockerenv"))
+                || Files.exists(Paths.get(MARKS_RUN_ROOT, ".containerenv"));
+    }
+
+    private boolean markSystemd() {
+        if (!Files.isDirectory(Paths.get(MARKS_RUN_ROOT, "systemd", "system"))) return false;
+        if (!Files.exists(Paths.get(MARKS_RUN_ROOT, "systemd", "private"))
+                && !Files.exists(Paths.get(MARKS_RUN_ROOT, "dbus", "system_bus_socket"))) {
+            return false;
+        }
+        if (!systemctlLocatable()) return false;
+        String comm = readLimitedText(MARKS_PROC_ROOT + "/1/comm");
+        if (comm != null) {
+            String trimmed = comm.trim();
+            if (!trimmed.isEmpty()) return trimmed.toLowerCase(Locale.ROOT).contains("systemd");
+        }
+        try {
+            String exe = Files.readSymbolicLink(Paths.get(MARKS_PROC_ROOT, "1", "exe")).getFileName().toString();
+            if (!exe.isEmpty() && !exe.toLowerCase(Locale.ROOT).contains("systemd")) return false;
+        } catch (Exception ignored) {
+            // 读不到 /proc/1/exe 不否决
+        }
+        return true;
+    }
+
+    private boolean systemctlLocatable() {
+        for (String relative : new String[]{"usr/bin/systemctl", "bin/systemctl", "usr/local/bin/systemctl"}) {
+            if (executable(Paths.get(MARKS_ROOT, relative))) return true;
+        }
+        String pathEnv = System.getenv("PATH");
+        if (pathEnv != null) {
+            for (String dir : pathEnv.split(java.io.File.pathSeparator)) {
+                if (!dir.isEmpty() && executable(Paths.get(dir, "systemctl"))) return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean executable(Path p) {
+        try {
+            return Files.isRegularFile(p) && Files.isExecutable(p);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private boolean charDeviceRW(String path, long major, long minor) {
+        try {
+            Path p = Paths.get(path);
+            long mode = ((Number) Files.getAttribute(p, "unix:mode", LinkOption.NOFOLLOW_LINKS)).longValue();
+            if ((mode & 0170000L) != 0020000L) return false; // S_IFCHR
+            long rdev = ((Number) Files.getAttribute(p, "unix:rdev", LinkOption.NOFOLLOW_LINKS)).longValue();
+            if (devMajor(rdev) != major || devMinor(rdev) != minor) return false;
+            try (java.nio.channels.SeekableByteChannel ignored =
+                         Files.newByteChannel(p, EnumSet.of(StandardOpenOption.READ, StandardOpenOption.WRITE))) {
+                return true;
+            }
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static long devMajor(long rdev) {
+        // Linux dev_t: major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & ~0xfff)
+        return ((rdev >> 8) & 0xfffL) | ((rdev >> 32) & ~0xfffL);
+    }
+
+    private static long devMinor(long rdev) {
+        return (rdev & 0xffL) | ((rdev >> 12) & 0xfff00L);
+    }
+
+    private boolean capEffBit(int bit) {
+        String status = readLimitedText(MARKS_PROC_ROOT + "/self/status");
+        if (status == null) return false;
+        for (String line : status.split("\\R")) {
+            if (line.startsWith("CapEff:")) {
+                String[] fields = line.trim().split("\\s+");
+                if (fields.length < 2) return false;
+                try {
+                    return ((Long.parseUnsignedLong(fields[1], 16) >>> bit) & 1L) == 1L;
+                } catch (NumberFormatException e) {
+                    return false;
+                }
+            }
+        }
+        return false;
+    }
+
+    private long effectiveUid() {
+        String status = readLimitedText(MARKS_PROC_ROOT + "/self/status");
+        if (status == null) return -1L;
+        for (String line : status.split("\\R")) {
+            if (line.startsWith("Uid:")) {
+                Long uid = secondFieldAsLong(line);
+                if (uid != null) return uid;
+            }
+        }
+        return -1L;
+    }
+
+    private String readLimitedText(String path) {
+        try (InputStream in = Files.newInputStream(Paths.get(path))) {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int total = 0;
+            int n;
+            while (total < MARKS_READ_LIMIT
+                    && (n = in.read(buf, 0, Math.min(buf.length, MARKS_READ_LIMIT - total))) > 0) {
+                out.write(buf, 0, n);
+                total += n;
+            }
+            return out.toString(StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private boolean fileContains(String path, byte[] needle, int limit, int chunk) {
+        try (InputStream in = Files.newInputStream(Paths.get(path))) {
+            byte[] carry = new byte[0];
+            byte[] block = new byte[chunk];
+            int remaining = limit;
+            while (remaining > 0) {
+                int n = in.read(block, 0, Math.min(chunk, remaining));
+                if (n <= 0) break;
+                remaining -= n;
+                byte[] window = new byte[carry.length + n];
+                System.arraycopy(carry, 0, window, 0, carry.length);
+                System.arraycopy(block, 0, window, carry.length, n);
+                if (indexOf(window, needle) >= 0) return true;
+                int overlap = Math.max(0, needle.length - 1);
+                carry = overlap > 0 && window.length > overlap
+                        ? Arrays.copyOfRange(window, window.length - overlap, window.length)
+                        : new byte[0];
+            }
+        } catch (Exception e) {
+            return false;
+        }
+        return false;
+    }
+
+    private static int indexOf(byte[] haystack, byte[] needle) {
+        if (needle.length == 0) return 0;
+        outer:
+        for (int i = 0; i + needle.length <= haystack.length; i++) {
+            for (int j = 0; j < needle.length; j++) {
+                if (haystack[i + j] != needle[j]) continue outer;
+            }
+            return i;
+        }
+        return -1;
+    }
+
+    private static Long secondFieldAsLong(String line) {
+        String[] fields = line.trim().split("\\s+");
+        if (fields.length < 2) return null;
+        try {
+            return Long.parseLong(fields[1]);
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
     // 🌟 新增：提取高能耗的实时监控快照生成器 (涉及频繁读取 /proc/net 文件系统)
     private Map<String, Object> buildRawStatusInfo() throws Exception {
@@ -2074,40 +3676,6 @@ public class kisama {
         st.put("message", " ");
         return st;
     }
-    // 🌟 修改：为函数增加 boolean isAuthenticated 参数
-    private Map<String, Object> buildBaseInfo(boolean isAuthenticated) throws Exception {
-        Map<String, Object> obj = new LinkedHashMap<>();
-        Map<String, String> ips = getPrimaryIpAddresses();
-
-        obj.put("arch", normalizeArch(System.getProperty("os.arch", " ")));
-        obj.put("cpu_cores", Runtime.getRuntime().availableProcessors());
-        obj.put("cpu_name", getCpuName());
-        obj.put("disk_total", Files.getFileStore(Paths.get(this.FILE_ROOT)).getTotalSpace());
-        obj.put("gpu_name", getGpuName());
-        obj.put("ipv4", emptyToNull(ips.get("ipv4")));
-        obj.put("ipv6", emptyToNull(ips.get("ipv6")));
-        obj.put("mem_total", getTotalMemoryBytes());
-        obj.put("os", getOsPrettyName());
-        obj.put("kernel_version", getKernelVersion());
-        obj.put("swap_total", getTotalSwapBytes());
-        obj.put("version", AGENT_VERSION);
-        obj.put("virtualization", getVirtualization());
-
-        // 🌟 修改：根据是否通过验证状态，动态清空核心敏感凭证
-        if (isAuthenticated) {
-            obj.put("session_key", Base64.getEncoder().encodeToString(this.SESSION_KEY));
-            Map<String, Object> noise = Map.of(
-                    "controller", Map.of("private", this.CTRL_PRIVATE_KEY_B64),
-                    "agent", Map.of("public", this.AGENT_PUBLIC_KEY_B64)
-            );
-            obj.put("noise_key", noise);
-        } else {
-            obj.put("session_key", null);
-            obj.put("noise_key", null);
-        }
-        return obj;
-    }
-
     private String normalizeArch(String arch) {
         if (arch == null) return " ";
         String a = arch.toLowerCase(Locale.ROOT);
@@ -2307,18 +3875,9 @@ public class kisama {
     }
 
     private Map<String, String> getPrimaryIpAddresses() {
-        String ipv4 = null;
-        String ipv6 = null;
-        String extIp = fetchExternalIp();
-        if (extIp != null) {
-            if (extIp.contains(":")) {
-                ipv6 = extIp;
-                log("[TRACE-NET] 成功通过外部接口获取公网 IPv6: " + ipv6);
-            } else {
-                ipv4 = extIp;
-                log("[TRACE-NET] 成功通过外部接口获取公网 IPv4: " + ipv4);
-            }
-        }
+        // 对齐 go/py: v4/v6 分族探测——外部服务优先且内容须校验, 本地网卡只作兜底
+        String ipv4 = fetchExternalIp(false);
+        String ipv6 = fetchExternalIp(true);
         if (ipv4 == null || ipv6 == null) {
             try {
                 Enumeration<java.net.NetworkInterface> nics = java.net.NetworkInterface.getNetworkInterfaces();
@@ -2338,7 +3897,12 @@ public class kisama {
                         } else if (ipv6 == null && addr instanceof java.net.Inet6Address) {
                             String h = addr.getHostAddress();
                             int zone = h.indexOf('%');
-                            ipv6 = zone >= 0 ? h.substring(0, zone) : h;
+                            h = zone >= 0 ? h.substring(0, zone) : h;
+                            // 本地兜底只接受公网全局单播 (2000::/3): ULA(fc00::/7)/多播/映射地址一律跳过,
+                            // 避免 docker 内网 IPv6 (如 fdXX::) 冒充公网 IPv6 上报 (0.6.0 实测线上 fdBA:: 泄漏)
+                            if (isGlobalUnicastIpv6Text(h)) {
+                                ipv6 = h;
+                            }
                         }
                         if (ipv4 != null && ipv6 != null) {
                             break;
@@ -2357,34 +3921,41 @@ public class kisama {
         return result;
     }
 
-    private String fetchExternalIp() {
-        String[] services = {
-                "https://api.ipify.org",
-                "https://icanhazip.com",
-                "https://checkip.amazonaws.com",
-                "https://ifconfig.me/ip",
-                "https://ipecho.net/plain",
-                "https://ipinfo.io/ip",
-                "https://myexternalip.com/raw"
-        };
-        java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
-                .connectTimeout(java.time.Duration.ofSeconds(2))
-                .build();
+    private String fetchExternalIp(boolean wantV6) {
+        // v6 用专用服务列表 (api6/v6.ident/api64 均解析或回显 v6), 探测结果还须通过全局单播校验;
+        // 无公网 IPv6 时返回 null, baseinfo/status 据此对该字段报 null (对齐 go/py/js)
+        String[] services = wantV6
+                ? new String[]{
+                        "https://api6.ipify.org",
+                        "https://v6.ident.me",
+                        "https://api64.ipify.org",
+                        "https://icanhazip.com"
+                }
+                : new String[]{
+                        "https://api.ipify.org",
+                        "https://icanhazip.com",
+                        "https://checkip.amazonaws.com",
+                        "https://ifconfig.me/ip",
+                        "https://ipecho.net/plain",
+                        "https://ipinfo.io/ip",
+                        "https://myexternalip.com/raw"
+                };
+        Map<String, String> ipProbeHeaders = new HashMap<>();
+        ipProbeHeaders.put("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) KisamaAgent/0.1.0");
         for (String service : services) {
             try {
-                java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
-                        .uri(java.net.URI.create(service))
-                        .timeout(java.time.Duration.ofSeconds(2))
-                        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) KisamaAgent/0.1.0")
-                        .GET()
-                        .build();
-                java.net.http.HttpResponse<String> response = client.send(
-                        request,
-                        java.net.http.HttpResponse.BodyHandlers.ofString()
-                );
+                // KISAMA_DNS=on 时经内置 DoH 解析探测服务域名 (secureSend), off 时行为不变
+                java.net.http.HttpResponse<String> response = secureSend(2, service, "GET", ipProbeHeaders,
+                        null, java.time.Duration.ofSeconds(2));
                 if (response.statusCode() == 200) {
                     String ip = response.body().trim();
-                    if (!ip.isBlank() && !ip.contains("<") && !ip.contains(" ") && ip.length() <= 45) {
+                    boolean valid = wantV6 ? isGlobalUnicastIpv6Text(ip) : isValidIpv4Text(ip);
+                    if (valid) {
+                        if (wantV6) {
+                            log("[TRACE-NET] 成功通过外部接口获取公网 IPv6: " + ip);
+                        } else {
+                            log("[TRACE-NET] 成功通过外部接口获取公网 IPv4: " + ip);
+                        }
                         return ip;
                     }
                 }
@@ -2395,6 +3966,26 @@ public class kisama {
             }
         }
         return null;
+    }
+
+    // 严格点分十进制 IPv4 文本校验: 拒绝含 ':' 的 v6 文本与越界八位组 (语义对齐 go isValidIPv4)
+    private static boolean isValidIpv4Text(String ip) {
+        if (ip == null || ip.contains(":")) return false;
+        if (!ip.matches("(\\d{1,3}\\.){3}\\d{1,3}")) return false;
+        for (String p : ip.split("\\.", -1)) {
+            if (Integer.parseInt(p) > 255) return false;
+        }
+        return true;
+    }
+
+    // 公网全局单播 IPv6 文本校验 (2000::/3): 剥离 %zone 后首个 hextet 须以 2/3 开头且满 4 位;
+    // 排除 ULA(fc00::/7)/链路本地(fe80::/10)/多播(ff00::/8)/回环/未指定/IPv4-mapped 等内网形态
+    private static boolean isGlobalUnicastIpv6Text(String ip) {
+        if (ip == null || ip.isBlank() || !ip.contains(":")) return false;
+        if (!ip.matches("[0-9a-fA-F:]+")) return false;
+        if (ip.indexOf('%') >= 0 || ip.indexOf('.') >= 0) return false;
+        String first = ip.substring(0, ip.indexOf(':'));
+        return first.matches("[23][0-9a-fA-F]{3}");
     }
 
     private String getGpuName() {
@@ -2553,7 +4144,7 @@ public class kisama {
                     Map<String, Object> info = new LinkedHashMap<>();
                     info.put("name", p.getFileName().toString());
                     info.put("path", Paths.get(this.FILE_ROOT).relativize(p).toString());
-                    info.put("type", s.isDirectory() ? "directory " : "file ");
+                    info.put("type", s.isDirectory() ? "directory" : "file");
                     info.put("size", s.size());
                     info.put("mtime", new Date(s.lastModifiedTime().toMillis()).toString());
                     info.put("mode", "-rw-r--r--");
@@ -2584,11 +4175,11 @@ public class kisama {
 
         if (!this.DEBUG) {
             if (ecdsaStr == null || ecdsaStr.isBlank() || ecdsaStr.contains("YOUR_HARDCODED_ECDSA_PUBLIC_KEY_HERE")) {
-                System.err.println("[FATAL-INIT] ❌ 启动熔断: ECDSA 公钥未配置，或仍在使用默认占位符！");
+                consoleErr("[FATAL-INIT] ❌ 启动熔断: ECDSA 公钥未配置，或仍在使用默认占位符！");
                 System.exit(1);
             }
             if (eciesStr == null || eciesStr.isBlank() || eciesStr.contains("YOUR_HARDCODED_ECIES_PUBLIC_KEY_HERE")) {
-                System.err.println("[FATAL-INIT] ❌ 启动熔断: ECIES 公钥未配置，或仍在使用默认占位符！");
+                consoleErr("[FATAL-INIT] ❌ 启动熔断: ECIES 公钥未配置，或仍在使用默认占位符！");
                 System.exit(1);
             }
         }
@@ -2610,7 +4201,7 @@ public class kisama {
             System.arraycopy(ctrlPub, 0, this.CONTROL_PUBLIC_KEY, 0, 32);
             log("[TRACE-CRYPTO] ✅ 成功激活全局超级终端 Noise 静态拓扑密钥链");
         } catch (Exception e) {
-            System.err.println("[FATAL-INIT] ❌ 启动流产: 初始化 Noise 临时本地密钥发生崩溃 -> " + e.getMessage());
+            consoleErr("[FATAL-INIT] ❌ 启动流产: 初始化 Noise 临时本地密钥发生崩溃 -> " + e.getMessage());
             System.exit(1);
         }
 
@@ -2633,9 +4224,9 @@ public class kisama {
                 this.ECDSA_PUBLIC_KEY = loadEcdsaPublicKey(ecdsaStr);
                 log("[TRACE-CRYPTO] ✅ ECDSA 安全公钥加载成功并通过结构化拓扑校验。");
             } catch (Exception e) {
-                System.err.println("[FATAL-INIT] ❌ 启动熔断: ECDSA 公钥内容破坏或格式不合法！损坏凭证: [" + ecdsaStr + "]");
-                System.err.println("[FATAL-INIT] 💡 异常堆栈信息: ");
-                e.printStackTrace();
+                consoleErr("[FATAL-INIT] ❌ 启动熔断: ECDSA 公钥内容破坏或格式不合法！损坏凭证: [" + ecdsaStr + "]");
+                consoleErr("[FATAL-INIT] 💡 异常堆栈信息: ");
+                consoleTrace(e);
                 System.exit(1);
             }
 
@@ -2643,9 +4234,9 @@ public class kisama {
                 this.ECIES_PUBLIC_KEY = Base64.getDecoder().decode(eciesStr.trim());
                 log("[TRACE-CRYPTO] ✅ ECIES 安全公钥 Base64 逆向解码合规性核验成功。");
             } catch (Exception e) {
-                System.err.println("[FATAL-INIT] ❌ 启动熔断: ECIES 公钥非合法的标准 Base64 编码流！损坏凭证: [" + eciesStr + "]");
-                System.err.println("[FATAL-INIT] 💡 异常堆栈信息: ");
-                e.printStackTrace();
+                consoleErr("[FATAL-INIT] ❌ 启动熔断: ECIES 公钥非合法的标准 Base64 编码流！损坏凭证: [" + eciesStr + "]");
+                consoleErr("[FATAL-INIT] 💡 异常堆栈信息: ");
+                consoleTrace(e);
                 System.exit(1);
             }
         }
@@ -2659,7 +4250,7 @@ public class kisama {
                 return Files.readString(path).trim();
             } catch (IOException e) {
                 // 杜绝静默吞掉异常，暴漏真实的权限或 I/O 错误
-                System.err.println("[FATAL-INIT] ❌ 读取密钥文件失败: " + path + ", 原因: " + e.getMessage());
+                consoleErr("[FATAL-INIT] ❌ 读取密钥文件失败: " + path + ", 原因: " + e.getMessage());
             }
         } else {
             logWarn("[TRACE-INIT] ⚠️ 密钥文件未找到: " + path + "，将尝试后续逻辑。");
@@ -2694,15 +4285,21 @@ public class kisama {
     }
 
     // ==================== 🔑 临时密钥管理器 (与 Python/JS 版语义一致) ====================
+    // 有效期内且 ttl 与当前密钥一致时幂等返回同一密钥对; ttl 变更或过期后自动生成新的密钥对, 旧密钥立即作废
     private final class TempKeyManager {
         private final Object lock = new Object();
         private long expiresAt = 0;
+        private long ttlSeconds = 0;
         private long createdAt = 0;
         private String keyId = "";
         private String ecdsaPrivatePem = "";
         private String ecdsaPublicPem = "";
         private String eciesPrivateHex = "";
         private String eciesPublicHex = "";
+        // 下发字段 (format=short 短格式, 0.5.8 docs/API.MD 十四)
+        private String ecdsaPrivateHex = "";
+        private String ecdsaPublicB64 = "";
+        private String eciesPublicB64 = "";
         private PublicKey ecdsaVk = null;
         private byte[] eciesPub = null;
         // 🔐 凭证生命周期钩子: tempkey 过期被检测到时触发一次长期密钥轮换
@@ -2717,7 +4314,19 @@ public class kisama {
             synchronized (lock) {
                 expireIfNeededLocked();
                 if (expiresAt > 0) {
-                    return snapshot();
+                    if (ttlSeconds == (long) ttlHours * 3600) {
+                        return snapshot();
+                    }
+                    // 🔐 ttl 变更: 旧密钥提前作废, 与自然过期同一安全依据触发轮换回调
+                    log("[TEMPKEY] 🔄 请求 ttl 变更, 旧临时密钥提前作废: key_id=" + keyId);
+                    expiresAt = 0;
+                    ecdsaVk = null;
+                    eciesPub = null;
+                    try {
+                        onExpired.run();
+                    } catch (Exception e) {
+                        logError("[TEMPKEY] ❌ ttl 变更轮换失败: " + e.getMessage());
+                    }
                 }
                 generate(ttlHours);
                 log("[TEMPKEY] 🔑 新临时密钥已生成: key_id=" + keyId + ", 有效期 " + ttlHours + " 小时");
@@ -2765,6 +4374,9 @@ public class kisama {
             m.put("ecdsa_public_key", ecdsaPublicPem);
             m.put("ecies_private_key", eciesPrivateHex);
             m.put("ecies_public_key", eciesPublicHex);
+            m.put("ecdsa_private_hex", ecdsaPrivateHex);
+            m.put("ecdsa_public_b64", ecdsaPublicB64);
+            m.put("ecies_public_b64", eciesPublicB64);
             return m;
         }
 
@@ -2784,10 +4396,19 @@ public class kisama {
             new SecureRandom().nextBytes(priv32);
             BigInteger d = new BigInteger(1, priv32);
             ECNamedCurveParameterSpec k1 = ECNamedCurveTable.getParameterSpec("secp256k1");
-            byte[] pub65 = k1.getG().multiply(d).normalize().getEncoded(false);
+            ECPoint eciesQ = k1.getG().multiply(d).normalize();
+            byte[] pub65 = eciesQ.getEncoded(false);
             this.eciesPrivateHex = toHex(priv32);
             this.eciesPublicHex = toHex(pub65);
             this.eciesPub = pub65;
+
+            // 3. 短格式下发字段 (0.5.8, docs/API.MD 十四): ECDSA 私钥标量 hex(64) +
+            //    双曲线 33 字节压缩公钥 Base64 (BC getEncoded(true), 与五端 short 契约一致)
+            java.security.interfaces.ECPrivateKey ecPriv = (java.security.interfaces.ECPrivateKey) pair.getPrivate();
+            ECPoint ecdsaQ = p256.getG().multiply(ecPriv.getS()).normalize();
+            this.ecdsaPrivateHex = toHex(bigIntToFixed32(ecPriv.getS()));
+            this.ecdsaPublicB64 = Base64.getEncoder().encodeToString(ecdsaQ.getEncoded(true));
+            this.eciesPublicB64 = Base64.getEncoder().encodeToString(eciesQ.getEncoded(true));
 
             byte[] id8 = new byte[8];
             new SecureRandom().nextBytes(id8);
@@ -2795,7 +4416,19 @@ public class kisama {
 
             long now = System.currentTimeMillis() / 1000;
             this.createdAt = now;
+            this.ttlSeconds = (long) ttlHours * 3600;
             this.expiresAt = now + (long) ttlHours * 3600;
+        }
+
+        private static byte[] bigIntToFixed32(BigInteger v) {
+            byte[] src = v.toByteArray();
+            byte[] out = new byte[32];
+            if (src.length >= 32) {
+                System.arraycopy(src, src.length - 32, out, 0, 32);
+            } else {
+                System.arraycopy(src, 0, out, 32 - src.length, src.length);
+            }
+            return out;
         }
 
         private static String pemWrap(byte[] der, String label) {
@@ -3038,10 +4671,10 @@ public class kisama {
             }
             // 🌟 修正：通过 agent 实例调用非静态方法
             agent.log("[TRACE-WS] 超级终端异常捕获: " + error.getMessage());
-            error.printStackTrace();
+            consoleTrace(error);
             if (error.getCause() != null) {
                 agent.log("[TRACE-WS] 🚨 发现隐藏在框架底层的真实元凶：");
-                error.getCause().printStackTrace();
+                consoleTrace(error.getCause());
             }
         }
     }
@@ -3281,7 +4914,7 @@ public class kisama {
                         startProcess();
                     } catch (Throwable t) { // 🌟 核心修改：由 Exception 改为 Throwable，确保能捕获底层的 LinkageError
                         agent.log("[TRACE-WS] Noise 第二阶段核验或伪终端启动瞬间爆裂: " + t.getMessage());
-                        t.printStackTrace(); // 打印底层真实的 Error 堆栈
+                        consoleTrace(t); // 打印底层真实的 Error 堆栈
                         cleanup();
                     }
                     return;
@@ -3560,7 +5193,22 @@ public class kisama {
     // 注册永远失败 (域名永久失效, 即"ECONNRESET 后连不上"的根因)。连续失败 N 次后重新注册
     // 换取新域名并回调通知 (KMODE=2 自动再上报 / KMODE=1 自动重写域名文件)。
     private static final int ARGO_REREGISTER_AFTER = argoEnvInt("KISAMA_ARGO_REREGISTER_AFTER", 5, 2);
-    private static final long ARGO_REREGISTER_RETRY_SECONDS = 30;   // 重新注册失败后的退避
+    private static final long ARGO_REREGISTER_RETRY_SECONDS = 30;   // 重新注册失败后的退避 (兼容保留, 退避序列中会被指数公式覆盖)
+    // 指数退避 + 封顶低频巡检: 短失败 2s 起、指数增长封顶 300s, 失败越久等越久, 成功清零
+    private static final int ARGO_RETRY_BASE_SECONDS = argoEnvInt("KISAMA_ARGO_RETRY_BASE_SECONDS", 2, 1);
+    private static final int ARGO_RETRY_MAX_SECONDS = argoEnvInt("KISAMA_ARGO_RETRY_MAX_SECONDS", 300, 60);
+    private static long argoBackoffSeconds(int failures) {
+        if (failures <= 0) return ARGO_RETRY_BASE_SECONDS;
+        long exp = Math.min(failures - 1L, 10L);
+        return Math.min(ARGO_RETRY_BASE_SECONDS * (1L << exp), ARGO_RETRY_MAX_SECONDS);
+    }
+    private static String argoTruncateError(String msg) {
+        if (msg == null) return null;
+        return msg.length() > 300 ? msg.substring(0, 300) : msg;
+    }
+    private static String argoNowIso() {
+        return java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString();
+    }
     // 读空闲超时 (秒): edge 有周期 PING, 长时间无任何入站数据 = 半开假死, 主动断开走重连; 0=禁用
     private static final int ARGO_IDLE_TIMEOUT = argoIdleTimeout();
 
@@ -4088,6 +5736,28 @@ public class kisama {
             }
         }
 
+        // composite struct list (list type 7): 指针 offset 字段存元素数, size 字段存每元素
+        // data/pointer 字数; 目标处 tag 字重复元素数与布局供读取方解析 — ConnectResponse.metadata
+        // 的 (key, value) 双 Text 字段列表 (0 data + 2 pointer words)
+        void writeStructList(int ptrWord, List<String[]> values) {
+            if (values.isEmpty()) {
+                words[ptrWord] = 0;
+                return;
+            }
+            int tag = alloc(1);
+            int stride = 2;
+            int items = alloc(values.size() * stride);
+            long offset = tag - ptrWord - 1;
+            words[ptrWord] = (((offset << 2) | 1) & 0xFFFFFFFFL)
+                    | ((((long) values.size() * stride) << 3 | 7) << 32);
+            words[tag] = ((long) values.size() << 2) | (2L << 48);
+            for (int i = 0; i < values.size(); i++) {
+                int base = items + i * stride;
+                writeBytes(base, values.get(i)[0].getBytes(StandardCharsets.UTF_8), true);
+                writeBytes(base + 1, values.get(i)[1].getBytes(StandardCharsets.UTF_8), true);
+            }
+        }
+
         byte[] finish() {
             byte[] out = new byte[8 + len * 8];
             out[0] = 0;
@@ -4188,7 +5858,9 @@ public class kisama {
             long segmentsMinusOne = u32le(buffer, pos);
             long firstWords = u32le(buffer, pos + 4);
             int segments = (int) segmentsMinusOne + 1;
-            int headerWords = 2 + segments;
+            // 标准 Cap'n Proto 流分帧: 段表 = 4B 段数-1 + 4B*段数, 8 字节对齐 —
+            // 单段消息表长 8B (曾误作 16B, 与 js/py 同源问题)
+            int headerWords = segments + 1;
             int headerSize = headerWords * 4;
             if (headerSize % 8 != 0) {
                 headerSize += 4;
@@ -4261,7 +5933,14 @@ public class kisama {
             }
         }
         String s = new String(raw, 0, (int) count, StandardCharsets.UTF_8);
-        return s.replaceAll("\\0+$", "");
+        // 剥离 capnp Text 的尾部 NUL 填充 (py 用 rstrip(b"\0") 同语义)。不能用正则
+        // replaceAll("\\0+$",""): Java 正则 \0 后必须再跟八进制数字, 单独 \0 编译即抛
+        // "Illegal octal escape sequence" — 曾致 capnpText 每次调用必抛, 注册应答永远解析失败
+        int end = s.length();
+        while (end > 0 && s.charAt(end - 1) == '\0') {
+            end--;
+        }
+        return s.substring(0, end);
     }
 
     private static final class CapnpReturnResult {
@@ -4297,29 +5976,43 @@ public class kisama {
         }
         int[] retInfo = capnpStruct(words, msgTarget + msgData);
         int retTarget = retInfo[0], retData = retInfo[1];
+        // 标准 capnp RPC: Return{answerId:u32 @data0, releaseParamCaps @data0.b4, union tag @data0.b6-7, ptr0}
         long which = (words[retTarget] >>> 48) & 0xFFFFL;
-        if (which == 1) {
-            return new CapnpReturnResult(false, null, false, capnpText(words, retTarget + retData));
+        if (which == 4) {
+            // exception@6: Exception{reason@0:Text, ...}
+            int[] excInfo = capnpStruct(words, retTarget + retData);
+            String reason = capnpText(words, excInfo[0] + excInfo[1]);
+            return new CapnpReturnResult(false, null, false, reason == null || reason.isEmpty() ? "unknown error" : reason);
         }
         if (which != 0) {
             return new CapnpReturnResult(false, null, false, "RPC return union " + which);
         }
         int[] payloadInfo = capnpStruct(words, retTarget + retData);
         int payloadTarget = payloadInfo[0], payloadData = payloadInfo[1];
+        if (payloadInfo[2] < 1) {
+            return new CapnpReturnResult(false, null, false, "empty RPC payload");
+        }
+        long contentPtr = words[payloadTarget + payloadData];
+        if ((contentPtr & 3L) == 3L) {
+            // bootstrap 应答: content = CapDescriptor (capability 指针), 非注册结果
+            return new CapnpReturnResult(false, null, false, "bootstrap");
+        }
         int[] contentInfo = capnpStruct(words, payloadTarget + payloadData);
-        int contentTarget = contentInfo[0], contentData = contentInfo[1];
-        long union = words[contentTarget];
-        long unionWhich = union & 0xFFFFL;
-        if (unionWhich == 0) {
-            return new CapnpReturnResult(false, null, false, capnpText(words, contentTarget + contentData));
+        int node = contentInfo[0], nodeData = contentInfo[1], nodePtrs = contentInfo[2];
+        // 边缘实机取证 (2026-10-31, QUIC 注册应答): content 外多一层信封 (data=0, ptrs=1)
+        if (nodeData == 0 && nodePtrs == 1) {
+            int[] inner = capnpStruct(words, node + nodeData);
+            node = inner[0];
+            nodeData = inner[1];
         }
-        if (unionWhich != 1) {
-            return new CapnpReturnResult(false, null, false, "registration union " + unionWhich);
+        long unionWhich = nodeData > 0 ? words[node] & 0xFFFFL : 0L;
+        if (unionWhich == 1L) {
+            int[] detailsInfo = capnpStruct(words, node + nodeData);
+            String location = capnpText(words, detailsInfo[0] + detailsInfo[1] + 1);
+            return new CapnpReturnResult(true, location, true, null);
         }
-        int[] detailsInfo = capnpStruct(words, contentTarget + contentData);
-        int detailsTarget = detailsInfo[0], detailsData = detailsInfo[1];
-        String location = capnpText(words, detailsTarget + detailsData + 1);
-        return new CapnpReturnResult(true, location, (words[detailsTarget] & 1L) != 0L, null);
+        String cause = capnpText(words, node + nodeData);
+        return new CapnpReturnResult(false, null, false, cause == null || cause.isEmpty() ? "unknown error" : cause);
     }
 
     // ==================== Quick Tunnel 注册与边缘连接 (对齐 cftunnel-product.js) ====================
@@ -4338,24 +6031,14 @@ public class kisama {
     }
 
     private static QuickTunnelInfo requestQuickTunnel(String service) throws Exception {
-        java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
-                .connectTimeout(java.time.Duration.ofSeconds(10))
-                .build();
-        java.net.http.HttpRequest request;
-        try {
-            request = java.net.http.HttpRequest.newBuilder()
-                    .uri(java.net.URI.create(service.replaceAll("/+$", "") + "/tunnel"))
-                    .timeout(java.time.Duration.ofSeconds(15))
-                    .header("Content-Type", "application/json")
-                    .header("User-Agent", "cftunnel.js/1.0")
-                    .POST(java.net.http.HttpRequest.BodyPublishers.noBody())
-                    .build();
-        } catch (Exception e) {
-            throw new Exception("requesting quick tunnel failed: " + e.getMessage());
-        }
+        Map<String, String> headers = new HashMap<>();
+        headers.put("Content-Type", "application/json");
+        headers.put("User-Agent", "cftunnel.js/1.0");
         java.net.http.HttpResponse<String> response;
         try {
-            response = client.send(request, java.net.http.HttpResponse.BodyHandlers.ofString());
+            // KISAMA_DNS=on 时经内置 DoH 解析 api.trycloudflare.com (secureSend), off 时行为不变
+            response = secureSend(10, service.replaceAll("/+$", "") + "/tunnel", "POST", headers,
+                    java.net.http.HttpRequest.BodyPublishers.noBody(), java.time.Duration.ofSeconds(15));
         } catch (Exception e) {
             throw new Exception("requesting quick tunnel failed: " + e.getMessage());
         }
@@ -4468,7 +6151,7 @@ public class kisama {
         Exception lastError = null;
         for (String host : hosts) {
             try {
-                return connectEdgeHost(host);
+                return connectEdgeHost(agent, host);
             } catch (Exception e) {
                 lastError = e;
                 agent.logWarn("[TRACE-ARGO] ⚠️ 边缘节点 " + host + " 连接失败: " + e.getMessage());
@@ -4477,9 +6160,37 @@ public class kisama {
         throw new Exception("all Cloudflare edges failed: " + (lastError != null ? lastError.getMessage() : "unknown"));
     }
 
-    private static javax.net.ssl.SSLSocket connectEdgeHost(String host) throws Exception {
+    private static javax.net.ssl.SSLSocket connectEdgeHost(kisama agent, String host) throws Exception {
+        // KISAMA_DNS=on 时 edge 入口经内置 DoH 解析后按 IP 建连 (逐 IP 尝试); SNI
+        // (h2.cftunnel.com) 与握手后自研证书校验 (verifyEdgeCertificate) 语义不变
+        List<String> connectTargets;
+        if (DNS_MODE_ON && !isIpLiteralText(host)) {
+            List<String> ips = SECURE_DNS.resolve(host, 0);
+            if (ips == null) {
+                warnDnsFallbackOnce(host);
+                connectTargets = Collections.singletonList(host);   // DoH 全失败 → 系统解析
+            } else if (ips.isEmpty()) {
+                throw new Exception("DNS: no record for " + host + " (secure dns)");
+            } else {
+                connectTargets = ips;
+            }
+        } else {
+            connectTargets = Collections.singletonList(host);
+        }
+        Exception lastError = null;
+        for (String target : connectTargets) {
+            try {
+                return connectEdgeHostTo(target);
+            } catch (Exception e) {
+                lastError = e;
+            }
+        }
+        throw lastError != null ? lastError : new Exception("edge connect failed: " + host);
+    }
+
+    private static javax.net.ssl.SSLSocket connectEdgeHostTo(String connectHost) throws Exception {
         javax.net.ssl.SSLSocket sock = (javax.net.ssl.SSLSocket) trustAllContext().getSocketFactory().createSocket();
-        sock.connect(new java.net.InetSocketAddress(host, EDGE_PORT), 10000);
+        sock.connect(new java.net.InetSocketAddress(connectHost, EDGE_PORT), 10000);
         javax.net.ssl.SSLParameters params = sock.getSSLParameters();
         params.setApplicationProtocols(new String[]{"h2"});
         params.setServerNames(Collections.singletonList(new javax.net.ssl.SNIHostName("h2.cftunnel.com")));
@@ -5109,6 +6820,2034 @@ public class kisama {
     }
 
     // ==================== 控制流: bootstrap + register (对齐 cftunnel-product.js) ====================
+    // ============================================================================
+    // 🚀 QUIC 边缘传输 (移植自 cftunnel-product.js 经 js 端实机验证的版本, BC 加密原语)
+    // 与 h2 路径同端口 7844, 但走 UDP: SNI 固定 quic.cftunnel.com, ALPN argotunnel。
+    // 注册协议 (Cap'n Proto bootstrap/register) 与 h2 完全共用, 传输可按隧道独立选择。
+    // 实机协议取证 (2026-10-31, js 端同源): 传输参数整数值按 varint 变长编码; 客户端
+    // 所有 Initial 包填充至 1200 字节 (RFC 9000 §14.1); 控制流 (流 0) 直接承载 capnp
+    // RPC 不写签名前导; websocket 类型响应经 ConnectResponse metadata 上报真实 101。
+    // ============================================================================
+    private static final String QUIC_SERVER_NAME = "quic.cftunnel.com";
+    private static final String QUIC_ALPN = "argotunnel";
+    private static final byte[] QUIC_DATA_STREAM_PREAMBLE = bytesFromHex("0a36cd12a13e3031");
+    private static final int QUIC_VERSION = 0x00000001;
+    private static final byte[] QUIC_INITIAL_SALT = bytesFromHex("38762cf7f55934b34d179ae6a4c80cadccbb7f0a");
+    private static final byte[] QUIC_HRR_RANDOM = bytesFromHex("cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c");
+    private static final int QUIC_SAMPLE_SIZE = 16;
+    private static final int QUIC_PN_LEN = 4;
+    private static final int QUIC_MAX_PACKET = 1232;
+    private static final int QUIC_MIN_INITIAL = 1200;
+    private static final int QUIC_EPOCH_INITIAL = 0;
+    private static final int QUIC_EPOCH_HANDSHAKE = 1;
+    private static final int QUIC_EPOCH_APPLICATION = 2;
+    private static final int QUIC_FRAME_PING = 0x01;
+    private static final int QUIC_FRAME_ACK = 0x02;
+    private static final int QUIC_FRAME_RESET_STREAM = 0x04;
+    private static final int QUIC_FRAME_STOP_SENDING = 0x05;
+    private static final int QUIC_FRAME_NEW_TOKEN = 0x07;
+    private static final int QUIC_FRAME_ACK_ECN = 0x03;
+    private static final int QUIC_FRAME_CRYPTO = 0x06;
+    private static final int QUIC_FRAME_STREAM = 0x08;
+    private static final int QUIC_FRAME_MAX_DATA = 0x10;
+    private static final int QUIC_FRAME_MAX_STREAM_DATA = 0x11;
+    private static final int QUIC_FRAME_MAX_STREAMS_BIDI = 0x12;
+    private static final int QUIC_FRAME_MAX_STREAMS_UNI = 0x13;
+    private static final int QUIC_FRAME_NEW_CONNECTION_ID = 0x18;
+    private static final int QUIC_FRAME_RETIRE_CONNECTION_ID = 0x19;
+    private static final int QUIC_FRAME_PATH_CHALLENGE = 0x1A;
+    private static final int QUIC_FRAME_PATH_RESPONSE = 0x1B;
+    private static final int QUIC_FRAME_TRANSPORT_CLOSE = 0x1C;
+    private static final int QUIC_FRAME_APPLICATION_CLOSE = 0x1D;
+    private static final int QUIC_FRAME_HANDSHAKE_DONE = 0x1E;
+    private static final int QUIC_FRAME_DATAGRAM = 0x30;
+    private static final int QUIC_FRAME_DATAGRAM_LEN = 0x31;
+    private static final int QUIC_PARAM_MAX_IDLE_TIMEOUT = 0x01;
+    private static final int QUIC_PARAM_MAX_UDP_PAYLOAD_SIZE = 0x03;
+    private static final int QUIC_PARAM_INITIAL_MAX_DATA = 0x04;
+    private static final int QUIC_PARAM_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL = 0x05;
+    private static final int QUIC_PARAM_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE = 0x06;
+    private static final int QUIC_PARAM_INITIAL_MAX_STREAM_DATA_UNI = 0x07;
+    private static final int QUIC_PARAM_INITIAL_MAX_STREAMS_BIDI = 0x08;
+    private static final int QUIC_PARAM_INITIAL_MAX_STREAMS_UNI = 0x09;
+    private static final int QUIC_PARAM_MAX_ACK_DELAY = 0x0B;
+    private static final int QUIC_PARAM_ACTIVE_CONNECTION_ID_LIMIT = 0x0E;
+    private static final int QUIC_PARAM_INITIAL_SOURCE_CONNECTION_ID = 0x0F;
+    private static final String QUIC_META_METHOD = "HttpMethod";
+    private static final String QUIC_META_HOST = "HttpHost";
+    private static final String QUIC_META_STATUS = "HttpStatus";
+    private static final String QUIC_META_HEADER = "HttpHeader";
+
+    private static byte[] bytesFromHex(String hex) {
+        byte[] out = new byte[hex.length() / 2];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = (byte) Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+        }
+        return out;
+    }
+
+    private static int quicVarintSize(long value) {
+        if (value < 0x40L) return 1;
+        if (value < 0x4000L) return 2;
+        if (value < 0x40000000L) return 4;
+        return 8;
+    }
+
+    private static byte[] quicWriteVarint(long value) {
+        int size = quicVarintSize(value);
+        byte[] out = new byte[size];
+        long v = value;
+        long prefix;
+        if (size == 1) prefix = 0L;
+        else if (size == 2) prefix = 0x40L;
+        else if (size == 4) prefix = 0x80L;
+        else prefix = 0xC0L;
+        for (int i = size - 1; i > 0; i--) {
+            out[i] = (byte) (v & 0xFF);
+            v >>>= 8;
+        }
+        out[0] = (byte) ((v & 0x3F) | prefix);
+        return out;
+    }
+
+    private static long[] quicReadVarint(byte[] buffer, int offset) {
+        if (buffer.length - offset < 1) return null;
+        int first = buffer[offset] & 0xFF;
+        int size = 1 << (first >> 6);
+        if (buffer.length - offset < size) return null;
+        long v = first & 0x3F;
+        for (int i = 1; i < size; i++) {
+            v = (v << 8) | (buffer[offset + i] & 0xFFL);
+        }
+        return new long[]{v, size};
+    }
+
+    private static final class QuicRange {
+        long start;
+        long length;
+        byte[] bytes = new byte[0];
+        boolean retransmitted = false;
+        boolean fin = false;
+        QuicRange(long s, long l) { start = s; length = l; }
+    }
+
+    private static List<QuicRange> quicRangesRemove(List<QuicRange> list, long start, long end) {
+        List<QuicRange> out = new ArrayList<>();
+        for (QuicRange item : list) {
+            long itemEnd = item.start + item.length;
+            if (itemEnd <= start || item.start >= end) {
+                out.add(item);
+                continue;
+            }
+            if (item.start < start) out.add(new QuicRange(item.start, start - item.start));
+            if (itemEnd > end) out.add(new QuicRange(end, itemEnd - end));
+        }
+        return out;
+    }
+
+    private static List<QuicRange> quicRangesUnion(List<QuicRange> a, List<QuicRange> b) {
+        List<QuicRange> merged = new ArrayList<>(a);
+        merged.addAll(b);
+        final List<QuicRange> ref = merged;
+        ref.sort((x, y) -> Long.compare(x.start, y.start));
+        List<QuicRange> out = new ArrayList<>();
+        for (QuicRange item : ref) {
+            long itemEnd = item.start + item.length;
+            if (!out.isEmpty()) {
+                QuicRange last = out.get(out.size() - 1);
+                if (item.start <= last.start + last.length) {
+                    last.length = Math.max(last.length, itemEnd - last.start);
+                    continue;
+                }
+            }
+            out.add(new QuicRange(item.start, item.length));
+        }
+        return out;
+    }
+
+    private static byte[] quicHkdfExtract(byte[] salt, byte[] ikm) {
+        org.bouncycastle.crypto.macs.HMac hmac = new org.bouncycastle.crypto.macs.HMac(new org.bouncycastle.crypto.digests.SHA256Digest());
+        hmac.init(new org.bouncycastle.crypto.params.KeyParameter(salt));
+        byte[] out = new byte[hmac.getMacSize()];
+        hmac.update(ikm, 0, ikm.length);
+        hmac.doFinal(out, 0);
+        return out;
+    }
+
+    private static byte[] quicHkdfExpand(String hash, byte[] prk, byte[] info, int length) {
+        org.bouncycastle.crypto.Digest digest;
+        if (hash.equals("sha384")) digest = new org.bouncycastle.crypto.digests.SHA384Digest();
+        else digest = new org.bouncycastle.crypto.digests.SHA256Digest();
+        org.bouncycastle.crypto.macs.HMac hmac = new org.bouncycastle.crypto.macs.HMac(digest);
+        hmac.init(new org.bouncycastle.crypto.params.KeyParameter(prk));
+        byte[] out = new byte[length];
+        byte[] block = new byte[hmac.getMacSize()];
+        int generated = 0;
+        int counter = 1;
+        while (generated < length) {
+            hmac.reset();
+            if (generated > 0) hmac.update(block, 0, block.length);
+            hmac.update(info, 0, info.length);
+            hmac.update((byte) counter);
+            hmac.doFinal(block, 0);
+            int take = Math.min(block.length, length - generated);
+            System.arraycopy(block, 0, out, generated, take);
+            generated += take;
+            counter++;
+        }
+        return out;
+    }
+
+    private static byte[] quicHkdfExpandLabel(String hash, byte[] secret, String label, byte[] context, int length) {
+        byte[] fullLabel = ("tls13 " + label).getBytes(StandardCharsets.UTF_8);
+        byte[] ctx = context == null ? new byte[0] : context;
+        byte[] info = new byte[2 + 1 + fullLabel.length + 1 + ctx.length];
+        info[0] = (byte) ((length >> 8) & 0xFF);
+        info[1] = (byte) (length & 0xFF);
+        info[2] = (byte) fullLabel.length;
+        System.arraycopy(fullLabel, 0, info, 3, fullLabel.length);
+        info[3 + fullLabel.length] = (byte) ctx.length;
+        System.arraycopy(ctx, 0, info, 4 + fullLabel.length, ctx.length);
+        return quicHkdfExpand(hash, secret, info, length);
+    }
+
+    private static final class QuicKeys {
+        final String hash;
+        final String cipherName;
+        final byte[] secret;
+        final byte[] key;
+        final byte[] iv;
+        byte[] hpKey;
+
+        QuicKeys(String hash, String cipherName, byte[] secret) {
+            this.hash = hash;
+            this.cipherName = cipherName;
+            this.secret = secret;
+            int keyLength = cipherName.equals("aes-256-gcm") ? 32 : 16;
+            this.key = quicHkdfExpandLabel(hash, secret, "quic key", new byte[0], keyLength);
+            this.iv = quicHkdfExpandLabel(hash, secret, "quic iv", new byte[0], 12);
+            this.hpKey = quicHkdfExpandLabel(hash, secret, "quic hp", new byte[0], keyLength);
+        }
+
+        byte[] nonce(long packetNumber) {
+            byte[] n = iv.clone();
+            long rest = packetNumber;
+            for (int i = 0; i < 8; i++) {
+                n[11 - i] ^= (byte) (rest & 0xFF);
+                rest >>>= 8;
+            }
+            return n;
+        }
+
+        byte[] mask(byte[] sample) {
+            org.bouncycastle.crypto.engines.AESEngine engine = new org.bouncycastle.crypto.engines.AESEngine();
+            engine.init(true, new org.bouncycastle.crypto.params.KeyParameter(hpKey));
+            byte[] block = new byte[16];
+            engine.processBlock(sample, 0, block, 0);
+            return java.util.Arrays.copyOf(block, 5);
+        }
+
+        byte[] seal(long packetNumber, byte[] plainHeader, byte[] payload) throws Exception {
+            org.bouncycastle.crypto.modes.GCMBlockCipher cipher = new org.bouncycastle.crypto.modes.GCMBlockCipher(new org.bouncycastle.crypto.engines.AESEngine());
+            cipher.init(true, new org.bouncycastle.crypto.params.AEADParameters(
+                    new org.bouncycastle.crypto.params.KeyParameter(key), 128, nonce(packetNumber), plainHeader));
+            byte[] out = new byte[payload.length + 16];
+            int written = cipher.processBytes(payload, 0, payload.length, out, 0);
+            written += cipher.doFinal(out, written);
+            return java.util.Arrays.copyOf(out, written);
+        }
+
+        byte[] open(long packetNumber, byte[] plainHeader, byte[] ciphertext) throws Exception {
+            org.bouncycastle.crypto.modes.GCMBlockCipher cipher = new org.bouncycastle.crypto.modes.GCMBlockCipher(new org.bouncycastle.crypto.engines.AESEngine());
+            cipher.init(false, new org.bouncycastle.crypto.params.AEADParameters(
+                    new org.bouncycastle.crypto.params.KeyParameter(key), 128, nonce(packetNumber), plainHeader));
+            byte[] out = new byte[Math.max(0, ciphertext.length - 16)];
+            int written = cipher.processBytes(ciphertext, 0, ciphertext.length, out, 0);
+            written += cipher.doFinal(out, written);
+            return java.util.Arrays.copyOf(out, written);
+        }
+    }
+
+    private static QuicKeys quicNextKeys(QuicKeys keys, boolean keepHeaderProtection) {
+        QuicKeys next = new QuicKeys(keys.hash, keys.cipherName,
+                quicHkdfExpandLabel(keys.hash, keys.secret, "quic ku", new byte[0], keys.secret.length));
+        if (keepHeaderProtection) {
+            // argo 边缘跨 key update 保留原 header protection key
+            next.hpKey = keys.hpKey;
+        }
+        return next;
+    }
+
+    private static QuicKeys[] quicInitialKeys(byte[] cid, boolean isClient) {
+        byte[] initial = quicHkdfExtract(QUIC_INITIAL_SALT, cid);
+        return new QuicKeys[]{
+                new QuicKeys("sha256", "aes-128-gcm", quicHkdfExpandLabel("sha256", initial, isClient ? "client in" : "server in", new byte[0], 32)),
+                new QuicKeys("sha256", "aes-128-gcm", quicHkdfExpandLabel("sha256", initial, isClient ? "server in" : "client in", new byte[0], 32)),
+        };
+    }
+
+    private static final class QuicByteSender {
+        final QuicConnection connection;
+        final java.util.List<QuicRange> pending = new ArrayList<>();
+        final java.util.List<QuicRange> unacked = new ArrayList<>();
+        byte[] data = new byte[0];
+        long frontier = 0;
+        boolean fin = false;
+        boolean finUnacked = false;
+
+        QuicByteSender(QuicConnection connection) { this.connection = connection; }
+
+        void append(byte[] payload, boolean end) {
+            if (payload.length > 0) {
+                byte[] old = data;
+                data = new byte[old.length + payload.length];
+                System.arraycopy(old, 0, data, 0, old.length);
+                System.arraycopy(payload, 0, data, old.length, payload.length);
+                pending.add(new QuicRange(old.length, payload.length));
+            }
+            if (end) {
+                fin = true;
+                finUnacked = true;
+            }
+        }
+
+        QuicRange take(long budget) {
+            if (pending.isEmpty() || budget <= 0) return null;
+            QuicRange range = pending.get(0);
+            long length = Math.min(range.length, budget);
+            QuicRange chunk = new QuicRange(range.start, length);
+            range.start += length;
+            range.length -= length;
+            if (range.length == 0) pending.remove(0);
+            chunk.bytes = java.util.Arrays.copyOfRange(data, (int) chunk.start, (int) (chunk.start + length));
+            chunk.retransmitted = chunk.start < frontier;
+            frontier = Math.max(frontier, chunk.start + length);
+            unacked.add(new QuicRange(chunk.start, length));
+            return chunk;
+        }
+
+        boolean takeFin() {
+            if (!fin || !finUnacked || !pending.isEmpty() || !unacked.isEmpty()) return false;
+            finUnacked = false;
+            return true;
+        }
+
+        void ack(long start, long length, boolean includeFin) {
+            java.util.List<QuicRange> kept = quicRangesRemove(unacked, start, start + length);
+            unacked.clear();
+            unacked.addAll(kept);
+            if (includeFin && fin && start + length >= data.length) finUnacked = false;
+            connection.onSendProgress();
+        }
+
+        void lossAll() {
+            if (!unacked.isEmpty()) {
+                frontier = unacked.get(0).start;
+                pending.addAll(unacked);
+                pending.sort((x, y) -> Long.compare(x.start, y.start));
+                unacked.clear();
+            }
+            if (fin) finUnacked = true;
+        }
+
+        void lossRanges(List<QuicRange> items) {
+            for (QuicRange item : items) {
+                if (item.length == 0) {
+                    if (item.fin && fin) finUnacked = true;
+                    continue;
+                }
+                java.util.List<QuicRange> kept = quicRangesRemove(unacked, item.start, item.start + item.length);
+                unacked.clear();
+                unacked.addAll(kept);
+                pending.add(new QuicRange(item.start, item.length));
+                pending.sort((x, y) -> Long.compare(x.start, y.start));
+            }
+        }
+
+        boolean idle() {
+            return pending.isEmpty() && unacked.isEmpty() && !finUnacked;
+        }
+    }
+
+    private static final class QuicOffsetBuffer {
+        long contiguous = 0;
+        private final java.util.List<Object[]> pending = new ArrayList<>();
+
+        byte[] accept(long start, byte[] bytes) {
+            if (start > contiguous + 1048576) return new byte[0];
+            if (start < contiguous) {
+                long drop = contiguous - start;
+                if (drop >= bytes.length) return new byte[0];
+                bytes = java.util.Arrays.copyOfRange(bytes, (int) drop, bytes.length);
+                start = contiguous;
+            }
+            if (bytes.length == 0) return new byte[0];
+            if (start != contiguous) {
+                pending.add(new Object[]{Long.valueOf(start), bytes.clone()});
+                return new byte[0];
+            }
+            java.util.List<byte[]> out = new ArrayList<>();
+            out.add(bytes);
+            contiguous += bytes.length;
+            boolean progress = true;
+            while (progress) {
+                progress = false;
+                for (int i = 0; i < pending.size(); i++) {
+                    if (((Long) pending.get(i)[0]).longValue() == contiguous) {
+                        byte[] chunk = (byte[]) pending.get(i)[1];
+                        out.add(chunk);
+                        contiguous += chunk.length;
+                        pending.remove(i);
+                        progress = true;
+                        break;
+                    }
+                }
+            }
+            int total = 0;
+            for (byte[] b : out) total += b.length;
+            byte[] merged = new byte[total];
+            int p = 0;
+            for (byte[] b : out) {
+                System.arraycopy(b, 0, merged, p, b.length);
+                p += b.length;
+            }
+            return merged;
+        }
+    }
+
+    private static byte[] quicApplyProtection(QuicKeys keys, byte[] packet, int pnOffset, boolean isLong) {
+        if (packet.length < pnOffset + 4 + QUIC_SAMPLE_SIZE) return null;
+        byte[] mask = keys.mask(java.util.Arrays.copyOfRange(packet, pnOffset + 4, pnOffset + 4 + QUIC_SAMPLE_SIZE));
+        byte[] out = packet.clone();
+        out[0] ^= mask[0] & (isLong ? 0x0F : 0x1F);
+        for (int i = 0; i < QUIC_PN_LEN; i++) {
+            out[pnOffset + i] ^= mask[1 + i];
+        }
+        return out;
+    }
+
+    private static Object[] quicRemoveProtection(QuicKeys keys, byte[] packet, int pnOffset, boolean isLong) {
+        if (packet.length < pnOffset + 4 + QUIC_SAMPLE_SIZE) return null;
+        byte[] mask = keys.mask(java.util.Arrays.copyOfRange(packet, pnOffset + 4, pnOffset + 4 + QUIC_SAMPLE_SIZE));
+        byte[] copy = packet.clone();
+        copy[0] ^= mask[0] & (isLong ? 0x0F : 0x1F);
+        int pnLength = (copy[0] & 0x03) + 1;
+        for (int i = 0; i < pnLength; i++) {
+            copy[pnOffset + i] ^= mask[1 + i];
+        }
+        long packetNumber = 0;
+        for (int i = 0; i < pnLength; i++) {
+            packetNumber = packetNumber * 256 + (copy[pnOffset + i] & 0xFF);
+        }
+        return new Object[]{java.util.Arrays.copyOf(copy, pnOffset + pnLength), Long.valueOf(packetNumber)};
+    }
+
+    private static long quicDecodePacketNumber(long largest, int bits, long truncated) {
+        long expected = largest + 1;
+        long mask = (1L << bits) - 1;
+        long candidate = (expected & ~mask) | truncated;
+        long half = 1L << (bits - 1);
+        if (candidate + half <= expected) {
+            candidate += 1L << bits;
+        } else if (candidate > expected + half && candidate >= (1L << bits)) {
+            candidate -= 1L << bits;
+        }
+        return candidate;
+    }
+
+    private static byte[] quicEncodeAck(List<QuicRange> ranges) {
+        java.util.List<QuicRange> sorted = new ArrayList<>(ranges);
+        sorted.sort((a, b) -> Long.compare(a.start, b.start));
+        QuicRange last = sorted.get(sorted.size() - 1);
+        long largest = last.start + last.length - 1;
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        out.write(QUIC_FRAME_ACK);
+        try {
+            out.write(quicWriteVarint(largest));
+            out.write(quicWriteVarint(0));
+            out.write(quicWriteVarint(sorted.size() - 1));
+            out.write(quicWriteVarint(largest - last.start));
+            long smallest = last.start;
+            for (int i = sorted.size() - 2; i >= 0; i--) {
+                QuicRange r = sorted.get(i);
+                long end = r.start + r.length - 1;
+                out.write(quicWriteVarint(smallest - end - 2));
+                out.write(quicWriteVarint(end - r.start));
+                smallest = r.start;
+            }
+        } catch (java.io.IOException ignored) {
+        }
+        return out.toByteArray();
+    }
+
+    private static long[] quicDecodeTransportParametersFull(byte[] buffer) {
+        long[] out = new long[64];
+        int pos = 0;
+        while (pos < buffer.length) {
+            long[] idP = quicReadVarint(buffer, pos);
+            if (idP == null) break;
+            int id = (int) idP[0];
+            pos += (int) idP[1];
+            long[] lenP = quicReadVarint(buffer, pos);
+            if (lenP == null) break;
+            int length = (int) lenP[0];
+            pos += (int) lenP[1];
+            if (buffer.length - pos < length) break;
+            if (length == 1 || length == 2 || length == 4 || length == 8) {
+                long parsed = 0;
+                for (int i = 0; i < length; i++) parsed = parsed * 256 + (buffer[pos + i] & 0xFF);
+                if (id < out.length) out[id] = parsed;
+            }
+            pos += length;
+        }
+        return out;
+    }
+
+    private static byte[] quicEncodeTransportParameters(java.util.List<Object[]> entries) {
+        // RFC 9000 §16: 整数传输参数按 varint 变长编码 (边缘 quic-go 校验声明长度与
+        // varint 自带长度一致, 实机确认); byte[] 值按字节串原样
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        for (Object[] entry : entries) {
+            int id = ((Integer) entry[0]).intValue();
+            byte[] body;
+            if (entry[1] instanceof byte[]) body = (byte[]) entry[1];
+            else body = quicWriteVarint(((Long) entry[1]).longValue());
+            byte[] idB = quicWriteVarint(id);
+            byte[] lenB = quicWriteVarint(body.length);
+            out.write(idB, 0, idB.length);
+            out.write(lenB, 0, lenB.length);
+            out.write(body, 0, body.length);
+        }
+        return out.toByteArray();
+    }
+
+    private static byte[] concatBytes(byte[] a, byte[] b) {
+        byte[] out = new byte[a.length + b.length];
+        System.arraycopy(a, 0, out, 0, a.length);
+        System.arraycopy(b, 0, out, a.length, b.length);
+        return out;
+    }
+
+    private static byte[] shortBytes(int v) {
+        return new byte[]{(byte) ((v >> 8) & 0xFF), (byte) (v & 0xFF)};
+    }
+
+    private static int intFrom3Bytes(byte[] b, int off) {
+        return ((b[off] & 0xFF) << 16) | ((b[off + 1] & 0xFF) << 8) | (b[off + 2] & 0xFF);
+    }
+
+    private static byte[] quicHmac(String hash, byte[] key, byte[] data) {
+        org.bouncycastle.crypto.Digest digest;
+        if (hash.equals("sha384")) digest = new org.bouncycastle.crypto.digests.SHA384Digest();
+        else digest = new org.bouncycastle.crypto.digests.SHA256Digest();
+        org.bouncycastle.crypto.macs.HMac hmac = new org.bouncycastle.crypto.macs.HMac(digest);
+        hmac.init(new org.bouncycastle.crypto.params.KeyParameter(key));
+        byte[] out = new byte[hmac.getMacSize()];
+        hmac.update(data, 0, data.length);
+        hmac.doFinal(out, 0);
+        return out;
+    }
+
+    private static byte[] quicEmptyHash(String hash) {
+        org.bouncycastle.crypto.Digest digest;
+        if (hash.equals("sha384")) digest = new org.bouncycastle.crypto.digests.SHA384Digest();
+        else digest = new org.bouncycastle.crypto.digests.SHA256Digest();
+        byte[] out = new byte[digest.getDigestSize()];
+        digest.doFinal(out, 0);
+        return out;
+    }
+
+    private static final class QuicTlsClient {
+        final String serverName;
+        final String alpn;
+        final byte[] parameters;
+        final byte[] privateKey = new byte[32];
+        final byte[] publicKey = new byte[32];
+        String hash = "sha256";
+        int hashLength = 32;
+        String cipher = "aes-128-gcm";
+        final java.util.List<byte[]> messages = new ArrayList<>();
+        String state = "start";
+        long[] remoteParameters = null;
+        String negotiatedAlpn = null;
+        byte[] leafCert = null;
+        byte[] handshakeSecret = null;
+        byte[] clientHandshakeSecret = null;
+        byte[] serverHandshakeSecret = null;
+
+        QuicTlsClient(String serverName, String alpn, byte[] parameters) {
+            this.serverName = serverName;
+            this.alpn = alpn;
+            this.parameters = parameters;
+            java.security.SecureRandom rand = new java.security.SecureRandom();
+            org.bouncycastle.math.ec.rfc7748.X25519.generatePrivateKey(rand, privateKey);
+            org.bouncycastle.math.ec.rfc7748.X25519.generatePublicKey(privateKey, 0, publicKey, 0);
+        }
+
+        byte[] transcript(int limit) {
+            org.bouncycastle.crypto.Digest digest;
+            if (hash.equals("sha384")) digest = new org.bouncycastle.crypto.digests.SHA384Digest();
+            else digest = new org.bouncycastle.crypto.digests.SHA256Digest();
+            int count = limit >= 0 ? limit : messages.size();
+            for (int i = 0; i < count; i++) {
+                byte[] m = messages.get(i);
+                digest.update(m, 0, m.length);
+            }
+            byte[] out = new byte[digest.getDigestSize()];
+            digest.doFinal(out, 0);
+            return out;
+        }
+
+        byte[] buildClientHello() {
+            byte[] name = serverName.getBytes(StandardCharsets.UTF_8);
+            byte[] sniBody = concatBytes(shortBytes(name.length + 3), concatBytes(new byte[]{0}, concatBytes(shortBytes(name.length), name)));
+            byte[] sni = concatBytes(shortBytes(0x0000), concatBytes(shortBytes(sniBody.length), sniBody));
+            byte[] groups = {(byte) 0x00, 0x0A, 0x00, 0x06, 0x00, 0x04, 0x00, 0x1D, 0x00, 0x17};
+            // signature_algorithms: 0403 ecdsa_secp256r1+sha256, 0804 rsa_pss_rsae+sha256,
+            // 0401 rsa_pkcs1+sha256, 0807 ecdsa_secp384r1+sha384 — 与 js/py 逐字对齐;
+            // 曾误写 0x80 0x04 / 0x80 0x07 (非法保留值), 边缘 Go TLS 解析到即 internal_error
+            // (CONNECTION_CLOSE code=0x132=alert 50), QUIC 握手必败
+            byte[] sigs = {0x00, 0x0D, 0x00, 0x0A, 0x00, 0x08, 0x04, 0x03, 0x08, 0x04, 0x04, 0x01, 0x08, 0x07};
+            byte[] versions = {0x00, 0x2B, 0x00, 0x03, 0x02, 0x03, 0x04};
+            byte[] ksBody = concatBytes(shortBytes(4 + publicKey.length), concatBytes(shortBytes(0x001D), concatBytes(shortBytes(publicKey.length), publicKey)));
+            byte[] keyShare = concatBytes(shortBytes(0x0033), concatBytes(shortBytes(ksBody.length), ksBody));
+            byte[] alpnList = concatBytes(new byte[]{(byte) alpn.length()}, alpn.getBytes(StandardCharsets.UTF_8));
+            // ALPN (RFC 7301): extension_data = u16 列表长度 + [u8 名字长度 + 名字] — 列表长度 2 字节、
+            // 名字长度 1 字节, 与 js/py 逐字对齐; 曾漏掉 u16 列表长度前缀, Go TLS 把名字首两字节当
+            // 列表长度读越界 → decode_error (TLS alert 50 = CONNECTION_CLOSE 0x132 = code=306), 握手必败
+            byte[] alpn = concatBytes(shortBytes(0x0010), concatBytes(shortBytes(alpnList.length + 2),
+                    concatBytes(shortBytes(alpnList.length), alpnList)));
+            byte[] pskModes = {0x00, 0x2D, 0x00, 0x02, 0x01, 0x01};
+            byte[] emptyExtensions = {(byte) 0xFF, 0x01, 0x00, 0x01, 0x00};
+            byte[] tp = concatBytes(shortBytes(0x0039), concatBytes(shortBytes(parameters.length), parameters));
+            byte[] extensions = concatBytes(sni, concatBytes(groups, concatBytes(sigs, concatBytes(versions,
+                    concatBytes(keyShare, concatBytes(alpn, concatBytes(pskModes, concatBytes(emptyExtensions, tp))))))));
+            byte[] suites = {0x00, 0x04, 0x13, 0x01, 0x13, 0x02};
+            byte[] random32 = new byte[32];
+            new java.security.SecureRandom().nextBytes(random32);
+            byte[] body = concatBytes(new byte[]{0x03, 0x03}, concatBytes(random32, concatBytes(new byte[]{0},
+                    concatBytes(suites, concatBytes(new byte[]{0x01, 0x00}, concatBytes(shortBytes(extensions.length), extensions))))));
+            byte[] message = concatBytes(new byte[]{1, (byte) ((body.length >> 16) & 0xFF), (byte) ((body.length >> 8) & 0xFF), (byte) (body.length & 0xFF)}, body);
+            messages.add(message);
+            state = "awaiting-server-hello";
+            return message;
+        }
+
+        byte[] serverHelloComplete(byte[] buffer) {
+            if (buffer.length < 4) return null;
+            if ((buffer[0] & 0xFF) != 2) throw new IllegalStateException("expected TLS ServerHello");
+            int length = intFrom3Bytes(buffer, 1);
+            if (buffer.length < 4 + length) return null;
+            return java.util.Arrays.copyOfRange(buffer, 0, 4 + length);
+        }
+
+        Object[] handleServerHello(byte[] message) throws Exception {
+            byte[] body = java.util.Arrays.copyOfRange(message, 4, message.length);
+            int pos = 2;
+            byte[] random = java.util.Arrays.copyOfRange(body, pos, pos + 32);
+            pos += 32;
+            if (java.util.Arrays.equals(random, QUIC_HRR_RANDOM)) {
+                throw new IllegalStateException("edge requested a HelloRetryRequest, which is not supported");
+            }
+            int sessionLen = body[pos] & 0xFF;
+            pos += 1 + sessionLen;
+            int cipherSuite = ((body[pos] & 0xFF) << 8) | (body[pos + 1] & 0xFF);
+            pos += 2;
+            pos += 1;
+            int extCount = ((body[pos] & 0xFF) << 8) | (body[pos + 1] & 0xFF);
+            pos += 2;
+            byte[] serverKey = null;
+            int seen = 0;
+            while (seen < extCount && body.length - pos >= 4) {
+                int type = ((body[pos] & 0xFF) << 8) | (body[pos + 1] & 0xFF);
+                int len = ((body[pos + 2] & 0xFF) << 8) | (body[pos + 3] & 0xFF);
+                byte[] value = java.util.Arrays.copyOfRange(body, pos + 4, pos + 4 + len);
+                pos += 4 + len;
+                seen++;
+                if (type == 0x0033 && value.length >= 4) {
+                    int group = ((value[0] & 0xFF) << 8) | (value[1] & 0xFF);
+                    int keyLen = ((value[2] & 0xFF) << 8) | (value[3] & 0xFF);
+                    if (group != 0x001D) {
+                        throw new IllegalStateException("edge selected unsupported key share group " + group);
+                    }
+                    serverKey = java.util.Arrays.copyOfRange(value, 4, 4 + keyLen);
+                } else if (type == 0x002B && value.length >= 2) {
+                    if (((value[0] & 0xFF) << 8 | (value[1] & 0xFF)) != 0x0304) {
+                        throw new IllegalStateException("edge selected an unsupported TLS version");
+                    }
+                }
+            }
+            if (serverKey == null) throw new IllegalStateException("ServerHello has no key_share");
+            if (cipherSuite == 0x1301) {
+                hash = "sha256"; hashLength = 32; cipher = "aes-128-gcm";
+            } else if (cipherSuite == 0x1302) {
+                hash = "sha384"; hashLength = 48; cipher = "aes-256-gcm";
+            } else {
+                throw new IllegalStateException("edge selected unsupported cipher suite " + Integer.toHexString(cipherSuite));
+            }
+            messages.add(message);
+            byte[] shared = new byte[32];
+            org.bouncycastle.math.ec.rfc7748.X25519.scalarMult(privateKey, 0, serverKey, 0, shared, 0);
+            byte[] zeros = new byte[hashLength];
+            byte[] early = quicHkdfExtract(zeros, zeros);
+            byte[] derived = quicHkdfExpandLabel(hash, early, "derived", quicEmptyHash(hash), hashLength);
+            handshakeSecret = quicHkdfExtract(derived, shared);
+            byte[] shHash = transcript(-1);
+            clientHandshakeSecret = quicHkdfExpandLabel(hash, handshakeSecret, "c hs traffic", shHash, hashLength);
+            serverHandshakeSecret = quicHkdfExpandLabel(hash, handshakeSecret, "s hs traffic", shHash, hashLength);
+            state = "awaiting-handshake";
+            return new Object[]{new QuicKeys(hash, cipher, clientHandshakeSecret), new QuicKeys(hash, cipher, serverHandshakeSecret)};
+        }
+
+        Object[] handleHandshakeMessage(byte[] message) throws Exception {
+            messages.add(message);
+            int type = message[0] & 0xFF;
+            if (type == 8) {
+                byte[] body = java.util.Arrays.copyOfRange(message, 4, message.length);
+                int pos = 2;
+                int count = ((body[pos] & 0xFF) << 8) | (body[pos + 1] & 0xFF);
+                pos += 2;
+                int seen = 0;
+                while (seen < count && body.length - pos >= 4) {
+                    int ext = ((body[pos] & 0xFF) << 8) | (body[pos + 1] & 0xFF);
+                    int len = ((body[pos + 2] & 0xFF) << 8) | (body[pos + 3] & 0xFF);
+                    byte[] value = java.util.Arrays.copyOfRange(body, pos + 4, pos + 4 + len);
+                    pos += 4 + len;
+                    seen++;
+                    if (ext == 0x0039) {
+                        remoteParameters = quicDecodeTransportParametersFull(value);
+                    } else if (ext == 0x0010 && value.length >= 3) {
+                        negotiatedAlpn = new String(value, 3, value.length - 3, StandardCharsets.UTF_8);
+                    }
+                }
+                return null;
+            }
+            if (type == 11) {
+                byte[] body = java.util.Arrays.copyOfRange(message, 4, message.length);
+                if (body.length >= 4) {
+                    int pos = 1 + (body[0] & 0xFF);
+                    if (pos + 3 <= body.length) {
+                        int listLen = intFrom3Bytes(body, pos);
+                        if (pos + 3 + listLen <= body.length && listLen >= 3) {
+                            int certLen = intFrom3Bytes(body, pos + 3);
+                            if (certLen > 0 && pos + 6 + certLen <= body.length) {
+                                leafCert = java.util.Arrays.copyOfRange(body, pos + 6, pos + 6 + certLen);
+                            }
+                        }
+                    }
+                }
+                return null;
+            }
+            if (type == 15 || type == 4) return null;
+            if (type != 20) return null;
+            byte[] serverFinished = messages.get(messages.size() - 1);
+            byte[] verifyData = java.util.Arrays.copyOfRange(serverFinished, 4, serverFinished.length);
+            byte[] hashBefore = transcript(messages.size() - 1);
+            byte[] serverFinishedKey = quicHkdfExpandLabel(hash, serverHandshakeSecret, "finished", new byte[0], hashLength);
+            byte[] expected = quicHmac(hash, serverFinishedKey, hashBefore);
+            boolean verified = expected.length == verifyData.length && java.security.MessageDigest.isEqual(expected, verifyData);
+            byte[] clientFinishedKey = quicHkdfExpandLabel(hash, clientHandshakeSecret, "finished", new byte[0], hashLength);
+            byte[] clientVerify = quicHmac(hash, clientFinishedKey, transcript(-1));
+            byte[] finished = concatBytes(new byte[]{20, (byte) ((clientVerify.length >> 16) & 0xFF), (byte) ((clientVerify.length >> 8) & 0xFF), (byte) (clientVerify.length & 0xFF)}, clientVerify);
+            byte[] zeros = new byte[hashLength];
+            byte[] derived = quicHkdfExpandLabel(hash, handshakeSecret, "derived", quicEmptyHash(hash), hashLength);
+            byte[] master = quicHkdfExtract(derived, zeros);
+            byte[] appHash = transcript(-1);
+            messages.add(finished);
+            byte[] clientApp = quicHkdfExpandLabel(hash, master, "c ap traffic", appHash, hashLength);
+            byte[] serverApp = quicHkdfExpandLabel(hash, master, "s ap traffic", appHash, hashLength);
+            state = "complete";
+            return new Object[]{Boolean.valueOf(verified), finished,
+                    new QuicKeys(hash, cipher, clientApp), new QuicKeys(hash, cipher, serverApp)};
+        }
+    }
+
+    private static String verifyEdgeQuicCertificate(byte[] der) {
+        if (der == null || der.length == 0) return "no edge certificate in TLS handshake";
+        try {
+            java.security.cert.CertificateFactory cf = java.security.cert.CertificateFactory.getInstance("X.509");
+            java.security.cert.X509Certificate cert = (java.security.cert.X509Certificate) cf.generateCertificate(new java.io.ByteArrayInputStream(der));
+            String issuerRfc = cert.getIssuerX500Principal().getName(javax.security.auth.x500.X500Principal.RFC2253);
+            String issuerLegacy = cert.getIssuerX500Principal().getName();
+            if (!issuerRfc.contains("CloudFlare") && !issuerLegacy.contains("CloudFlare")) {
+                return "issuer mismatch: " + issuerRfc;
+            }
+            if (!issuerRfc.contains("CloudFlare Origin SSL") && !issuerLegacy.contains("CloudFlare Origin SSL")) {
+                return "issuer OU mismatch: " + issuerRfc;
+            }
+            String subject = cert.getSubjectX500Principal().getName();
+            if (!subject.contains("CloudFlare Origin Certificate")) return "subject CN mismatch: " + subject;
+            boolean covered = false;
+            java.util.Collection<java.util.List<?>> sans = cert.getSubjectAlternativeNames();
+            if (sans != null) {
+                for (java.util.List<?> san : sans) {
+                    if (san.size() >= 2 && Integer.valueOf(2).equals(san.get(0))) {
+                        String dns = String.valueOf(san.get(1)).toLowerCase();
+                        if (dns.equals("quic.cftunnel.com") || dns.equals("cftunnel.com")
+                                || (dns.startsWith("*.") && "quic.cftunnel.com".endsWith(dns.substring(1)))) {
+                            covered = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!covered) return "SAN does not cover quic.cftunnel.com";
+            return null;
+        } catch (Exception e) {
+            return "unreadable edge certificate: " + e.getMessage();
+        }
+    }
+
+    private static final class QuicStream {
+        final long id;
+        final String initiator;
+        final QuicConnection connection;
+        final QuicByteSender send;
+        long sentEnd = 0;
+        byte[] recv = new byte[0];
+        final QuicOffsetBuffer receiver = new QuicOffsetBuffer();
+        boolean ended = false;
+        boolean reset = false;
+        long peerLimit = 0;
+        long localLimit;
+        Object userData = null;
+
+        QuicStream(QuicConnection connection, long id, String initiator) {
+            this.id = id;
+            this.initiator = initiator;
+            this.connection = connection;
+            this.send = new QuicByteSender(connection);
+            this.localLimit = connection.localStreamData;
+        }
+
+        void write(byte[] payload, boolean end) {
+            send.append(payload, end);
+            connection.markSendReady(this);
+        }
+    }
+
+    private static final class QuicConnection {
+        final String host;
+        final int port;
+        final Object log;
+        final String serverName;
+        final String alpn;
+        java.util.function.Consumer<QuicStream> onStream = c -> {};
+        java.util.function.BiConsumer<QuicStream, byte[]> onStreamData = (c, d) -> {};
+        java.util.function.Consumer<QuicStream> onStreamEnd = c -> {};
+        java.util.function.Consumer<String> onClose = c -> {};
+        final int maxPacket = QUIC_MAX_PACKET;
+        final long idleTimeout;
+        final long keepAlive = 1000;
+        final int maxInflight = 256;
+        long localMaxData = 1L << 22;
+        final long localStreamData = 1L << 20;
+        final boolean verifyCertificate;
+        final byte[] ourCid;
+        byte[] peerCid;
+        final int receiveWindow = 1 << 20;
+        volatile boolean stoppedFlag = false;
+        final byte[] localParameters;
+        final QuicTlsClient tls;
+        java.net.DatagramSocket sock = null;
+        volatile String closed = null;
+        volatile boolean closing = false;
+        String closeReason = null;
+        final java.util.concurrent.CountDownLatch handshakeEvent = new java.util.concurrent.CountDownLatch(1);
+        final QuicKeys[][] keys = new QuicKeys[3][];
+        final java.util.List<Object[]> appRecvGens = new ArrayList<>();
+        final QuicKeys[] appSendKeys = new QuicKeys[2];
+        volatile int appKeyPhase = 0;
+        final long[] pnSend = new long[3];
+        final long[] largestRecv = {-1, -1, -1};
+        final java.util.List<QuicRange>[] recvRanges = new java.util.List[3];
+        final boolean[] ackPending = new boolean[3];
+        final java.util.List<Object[]>[] inFlight = new java.util.List[3];
+        final QuicByteSender[] cryptoSend = new QuicByteSender[3];
+        final QuicOffsetBuffer[] tlsOffsets = new QuicOffsetBuffer[3];
+        byte[] serverHello = new byte[0];
+        byte[] handshakeBytes = new byte[0];
+        final java.util.Map<Long, QuicStream> streams = new java.util.concurrent.ConcurrentHashMap<>();
+        // 会话回调从代理线程触发 markSendReady/creditReady, 读循环线程并发迭代 → 写时复制保证安全
+        final java.util.List<QuicStream> sendReady = new java.util.concurrent.CopyOnWriteArrayList<>();
+        long nextLocalStream = 0;
+        long peerMaxData = 0;
+        long peerStreamRemote = 0;
+        long peerStreamLocal = 0;
+        long connectionSent = 0;
+        long consumedTotal = 0;
+        boolean creditMaxData = false;
+        final java.util.List<QuicStream> creditReady = new java.util.concurrent.CopyOnWriteArrayList<>();
+        final java.util.List<Object[]> pendingOneOff = new java.util.concurrent.CopyOnWriteArrayList<>();
+        volatile boolean handshakeComplete = false;
+        volatile boolean finishedSent = false;
+        volatile boolean confirmed = false;
+        volatile boolean registered = false;
+        volatile boolean registrationFailed = false;
+        int txDebugCount = 0;
+        int rxDebugCount = 0;
+        int pto = 250;
+        int retransmits = 0;
+        final long initialWindow;
+        final long minWindow;
+        long congestionWindow;
+        long slowStartThreshold = Long.MAX_VALUE;
+        final long maxWindow;
+        Long srtt = null;
+        Long rttvar = null;
+        long peerMaxAckDelay = 25;
+        int ptoCount = 0;
+        final int kPacketThreshold = 3;
+        volatile long lastReceived = 0;
+        volatile long lastEliciting = 0;
+        volatile boolean pingPending = false;
+        int initialSent = 0;
+        byte[] peerToken = new byte[0];
+        long[] remoteParameters = null;
+        final java.util.Map<String, Long> stats = new java.util.concurrent.ConcurrentHashMap<>();
+        java.net.InetSocketAddress sendAddr = null;
+        Thread loopThread = null;
+
+        QuicConnection(String host, int port, Object log, String serverName, String alpn, long idleTimeout, boolean verifyCertificate) {
+            this.host = host;
+            this.port = port;
+            this.log = log;
+            this.serverName = serverName;
+            this.alpn = alpn;
+            this.idleTimeout = idleTimeout;
+            this.verifyCertificate = verifyCertificate;
+            this.ourCid = new byte[8];
+            new java.security.SecureRandom().nextBytes(ourCid);
+            this.peerCid = new byte[8];
+            new java.security.SecureRandom().nextBytes(peerCid);
+            java.util.List<Object[]> params = new ArrayList<>();
+            params.add(new Object[]{Integer.valueOf(QUIC_PARAM_MAX_IDLE_TIMEOUT), Long.valueOf(idleTimeout)});
+            params.add(new Object[]{Integer.valueOf(QUIC_PARAM_INITIAL_MAX_DATA), Long.valueOf(localMaxData)});
+            params.add(new Object[]{Integer.valueOf(QUIC_PARAM_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL), Long.valueOf(localStreamData)});
+            params.add(new Object[]{Integer.valueOf(QUIC_PARAM_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE), Long.valueOf(localStreamData)});
+            params.add(new Object[]{Integer.valueOf(QUIC_PARAM_INITIAL_MAX_STREAM_DATA_UNI), Long.valueOf(localStreamData)});
+            params.add(new Object[]{Integer.valueOf(QUIC_PARAM_INITIAL_MAX_STREAMS_BIDI), Long.valueOf(1 << 24)});
+            params.add(new Object[]{Integer.valueOf(QUIC_PARAM_INITIAL_MAX_STREAMS_UNI), Long.valueOf(1 << 24)});
+            params.add(new Object[]{Integer.valueOf(QUIC_PARAM_MAX_UDP_PAYLOAD_SIZE), Long.valueOf(maxPacket)});
+            params.add(new Object[]{Integer.valueOf(QUIC_PARAM_ACTIVE_CONNECTION_ID_LIMIT), Long.valueOf(8)});
+            params.add(new Object[]{Integer.valueOf(QUIC_PARAM_INITIAL_SOURCE_CONNECTION_ID), ourCid});
+            this.localParameters = quicEncodeTransportParameters(params);
+            this.tls = new QuicTlsClient(serverName, alpn, localParameters);
+            this.initialWindow = 10L * maxPacket;
+            this.minWindow = 2L * maxPacket;
+            this.congestionWindow = initialWindow;
+            this.maxWindow = (long) maxInflight * maxPacket;
+            for (int i = 0; i < 3; i++) {
+                recvRanges[i] = new ArrayList<>();
+                inFlight[i] = new ArrayList<>();
+                cryptoSend[i] = new QuicByteSender(this);
+                tlsOffsets[i] = new QuicOffsetBuffer();
+            }
+        }
+
+        // 日志适配: logger 恒为 kisama 实例 (connectEdgeQuic 传入), 直调外层 logAt 系列;
+        // 曾按反射找 debug/info/warning 方法 — kisama 上不存在这些名字, 全部静默 no-op
+        // (QUICDBG 调试钩子因此从未输出过)
+        void logDebug(String msg) {
+            if (log instanceof kisama) ((kisama) log).logDebug(msg);
+        }
+
+        void logInfo(String msg) {
+            if (log instanceof kisama) ((kisama) log).log(msg);
+        }
+
+        void logWarning(String msg) {
+            if (log instanceof kisama) ((kisama) log).logWarn(msg);
+        }
+
+        synchronized void setStopped(boolean value) {
+            stoppedFlag = value;
+            if (value && closed == null && !closing) close("registration failed");
+        }
+
+        java.net.DatagramSocket connect(long timeoutMs) throws Exception {
+            sock = new java.net.DatagramSocket();
+            sock.setSoTimeout(20);
+            java.net.InetAddress addr = java.net.InetAddress.getByName(host);
+            sendAddr = new java.net.InetSocketAddress(addr, port);
+            keys[QUIC_EPOCH_INITIAL] = quicInitialKeys(peerCid, true);
+            cryptoSend[QUIC_EPOCH_INITIAL].append(tls.buildClientHello(), false);
+            long now = System.currentTimeMillis();
+            lastReceived = now;
+            lastEliciting = now;
+            loopThread = new Thread(this::runLoop, "quic-conn");
+            loopThread.setDaemon(true);
+            loopThread.start();
+            if (!handshakeEvent.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                if (closed == null) _fail("handshake timeout");
+                throw new java.io.IOException("quic handshake failed: " + closed);
+            }
+            if (closed != null) throw new java.io.IOException("quic handshake failed: " + closed);
+            return sock;
+        }
+
+        private void runLoop() {
+            try {
+                byte[] buf = new byte[65536];
+                java.net.DatagramPacket dp = new java.net.DatagramPacket(buf, buf.length);
+                while (closed == null) {
+                    try {
+                        sock.receive(dp);
+                        byte[] data = java.util.Arrays.copyOfRange(dp.getData(), 0, dp.getLength());
+                        _onDatagram(data);
+                    } catch (java.net.SocketTimeoutException ignored) {
+                    } catch (java.io.IOException e) {
+                        break;
+                    }
+                    if (closed == null) _tick();
+                }
+            } catch (Exception e) {
+                _fail("receive failed: " + e.getMessage());
+            } finally {
+                if (sock != null) sock.close();
+            }
+        }
+
+        void onSendProgress() {
+            retransmits = 0;
+            ptoCount = 0;
+        }
+
+        QuicStream openStream() {
+            QuicStream stream = new QuicStream(this, nextLocalStream, "local");
+            nextLocalStream += 4;
+            streams.put(Long.valueOf(stream.id), stream);
+            return stream;
+        }
+
+        void sendData(long streamId, byte[] payload, boolean endStream) {
+            QuicStream stream = streams.get(Long.valueOf(streamId));
+            if (stream == null) throw new IllegalStateException("unknown stream " + streamId);
+            stream.write(payload, endStream);
+        }
+
+        void markSendReady(QuicStream stream) {
+            if (!sendReady.contains(stream)) sendReady.add(stream);
+        }
+
+        void close(String reason) {
+            if (closed != null) return;
+            closing = true;
+            closeReason = reason == null ? "close" : reason;
+            _tick();
+            Thread t = new Thread(() -> {
+                try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+                _finish(null);
+            });
+            t.setDaemon(true);
+            t.start();
+        }
+
+        private void _tick() {
+            if (closed != null) return;
+            long now = System.currentTimeMillis();
+            _checkLoss(now);
+            if (keepAlive > 0 && handshakeComplete && now - lastEliciting >= keepAlive) {
+                pingPending = true;
+            }
+            int sent = 0;
+            while (sent < 16 && totalInFlight() < maxInflight
+                    && (inFlightBytes() < sendWindow() || ackDue() || closing)) {
+                Object[] built = _buildPacket();
+                if (built == null) break;
+                _transmit(built);
+                sent++;
+            }
+            if (now - lastReceived > Math.max(idleTimeout, 15000)) {
+                _fail("peer idle for " + (now - lastReceived) + "ms");
+            }
+        }
+
+        private int totalInFlight() {
+            int n = 0;
+            for (int e = 0; e < 3; e++) n += inFlight[e].size();
+            return n;
+        }
+
+        private long inFlightBytes() {
+            long n = 0;
+            for (int e = 0; e < 3; e++) {
+                for (Object[] entry : inFlight[e]) n += ((Long) entry[2]).longValue();
+            }
+            return n;
+        }
+
+        private boolean ackDue() {
+            for (int e = 0; e < 3; e++) {
+                if (keys[e] != null && ackPending[e] && !recvRanges[e].isEmpty()) return true;
+            }
+            return false;
+        }
+
+        private long sendWindow() {
+            return handshakeComplete ? congestionWindow : Long.MAX_VALUE;
+        }
+
+        private long ptoDuration() {
+            return Math.max(pto * (1L << Math.min(ptoCount, 20)), 20);
+        }
+
+        private void _checkLoss(long now) {
+            for (int epoch = 0; epoch < 3; epoch++) {
+                java.util.List<Object[]> list = inFlight[epoch];
+                if (list.isEmpty()) continue;
+                if (now - ((Long) list.get(0)[1]).longValue() < ptoDuration()) continue;
+                Object[] entry = list.remove(0);
+                returnLost(epoch, entry);
+                retransmits++;
+                ptoCount++;
+                if (retransmits > 24) {
+                    _fail("no response after " + retransmits + " retransmits");
+                    return;
+                }
+            }
+        }
+
+        private void returnLost(int epoch, Object[] entry) {
+            Object[] crypto = (Object[]) entry[3];
+            if (crypto != null) {
+                cryptoSend[epoch].lossRanges(java.util.Collections.singletonList(
+                        new QuicRange(((Long) crypto[0]).longValue(), ((Long) crypto[1]).longValue())));
+            }
+            @SuppressWarnings("unchecked")
+            java.util.List<Object[]> streams = (java.util.List<Object[]>) entry[4];
+            for (Object[] item : streams) {
+                QuicStream stream = (QuicStream) item[0];
+                long start = ((Long) item[1]).longValue();
+                long length = ((Long) item[2]).longValue();
+                boolean fin = ((Boolean) item[3]).booleanValue();
+                stream.send.lossRanges(java.util.Collections.singletonList(new QuicRange(start, length)));
+                if (fin) stream.send.lossRanges(java.util.Collections.singletonList(new QuicRange(start + length, 0)));
+                markSendReady(stream);
+            }
+        }
+
+        private void _discardEpoch(int epoch, String reason) {
+            if (keys[epoch] == null) return;
+            keys[epoch] = null;
+            inFlight[epoch].clear();
+        }
+
+        private void _flushHandshakeAck() {
+            // 丢弃握手密钥前冲刷未确认的 handshake-epoch ACK: 边缘的 ack-eliciting 握手包
+            // (如 Finished 的 CRYPTO 包) 若不获 ACK 会按 RFC 9002 无限重传, 而密钥丢弃后
+            // pickEpoch 因 keys=null 永远跳过 HANDSHAKE, ACK 再也发不出去
+            int epoch = QUIC_EPOCH_HANDSHAKE;
+            QuicKeys[] ks = keys[epoch];
+            if (ks == null || !ackPending[epoch] || recvRanges[epoch].isEmpty()) return;
+            int from = Math.max(0, recvRanges[epoch].size() - 16);
+            byte[] frame = quicEncodeAck(recvRanges[epoch].subList(from, recvRanges[epoch].size()));
+            ackPending[epoch] = false;
+            long packetNumber = pnSend[epoch];
+            pnSend[epoch]++;
+            Object[] h = header(epoch, QUIC_PN_LEN + frame.length + 16, packetNumber);
+            byte[] aad = concatBytes((byte[]) h[0], (byte[]) h[1]);
+            int pnOffset = ((Integer) h[2]).intValue();
+            boolean isLong = ((Boolean) h[3]).booleanValue();
+            try {
+                byte[] sealed = concatBytes(aad, ks[0].seal(packetNumber, aad, frame));
+                byte[] protectedPacket = quicApplyProtection(ks[0], sealed, pnOffset, isLong);
+                if (protectedPacket == null) {
+                    ackPending[epoch] = true;
+                    return;
+                }
+                _transmit(new Object[]{Integer.valueOf(epoch), protectedPacket, Long.valueOf(packetNumber),
+                        null, new ArrayList<Object[]>(), Boolean.valueOf(false)});
+            } catch (Exception e) {
+                ackPending[epoch] = true;
+            }
+        }
+
+        private void _confirmHandshake() {
+            if (confirmed || !handshakeComplete || !finishedSent) return;
+            _flushHandshakeAck();
+            confirmed = true;
+            _discardEpoch(QUIC_EPOCH_HANDSHAKE, "handshake confirmed");
+            _discardEpoch(QUIC_EPOCH_INITIAL, "handshake confirmed");
+        }
+
+        private int headerOverhead(int epoch) {
+            int tag = 16;
+            if (epoch == QUIC_EPOCH_APPLICATION) {
+                return 1 + peerCid.length + QUIC_PN_LEN + tag;
+            }
+            if (epoch == QUIC_EPOCH_HANDSHAKE) {
+                return 1 + 4 + 1 + peerCid.length + 1 + ourCid.length + 2 + QUIC_PN_LEN + tag;
+            }
+            return 1 + 4 + 1 + peerCid.length + 1 + ourCid.length
+                    + quicVarintSize(peerToken.length) + peerToken.length
+                    + 2 + QUIC_PN_LEN + tag;
+        }
+
+        private Object[] header(int epoch, int protectedLength, long packetNumber) {
+            byte[] pnBytes = new byte[QUIC_PN_LEN];
+            for (int i = 0; i < QUIC_PN_LEN; i++) {
+                pnBytes[i] = (byte) ((packetNumber >>> ((QUIC_PN_LEN - 1 - i) * 8)) & 0xFF);
+            }
+            if (epoch == QUIC_EPOCH_APPLICATION) {
+                byte firstByte = (byte) (0x40 | (appKeyPhase << 2) | (QUIC_PN_LEN - 1));
+                byte[] hdr = concatBytes(new byte[]{firstByte}, peerCid);
+                return new Object[]{hdr, pnBytes, Integer.valueOf(1 + peerCid.length), Boolean.FALSE};
+            }
+            int extType = epoch == QUIC_EPOCH_INITIAL ? 0 : 2;
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            out.write(0xC0 | (extType << 4) | (QUIC_PN_LEN - 1));
+            out.write((QUIC_VERSION >>> 24) & 0xFF);
+            out.write((QUIC_VERSION >>> 16) & 0xFF);
+            out.write((QUIC_VERSION >>> 8) & 0xFF);
+            out.write(QUIC_VERSION & 0xFF);
+            out.write(peerCid.length);
+            out.write(peerCid, 0, peerCid.length);
+            if (epoch == QUIC_EPOCH_INITIAL) {
+                out.write(ourCid.length);
+                out.write(ourCid, 0, ourCid.length);
+                byte[] tv = quicWriteVarint(peerToken.length);
+                out.write(tv, 0, tv.length);
+                if (peerToken.length > 0) out.write(peerToken, 0, peerToken.length);
+            } else {
+                out.write(0);
+            }
+            int pl = 0x4000 | protectedLength;
+            out.write((pl >> 8) & 0xFF);
+            out.write(pl & 0xFF);
+            byte[] hdr = out.toByteArray();
+            return new Object[]{hdr, pnBytes, Integer.valueOf(hdr.length), Boolean.TRUE};
+        }
+
+        private int pickEpoch() {
+            int[] order = {QUIC_EPOCH_INITIAL, QUIC_EPOCH_HANDSHAKE, QUIC_EPOCH_APPLICATION};
+            for (int epoch : order) {
+                if (keys[epoch] == null) continue;
+                if (ackPending[epoch] && !recvRanges[epoch].isEmpty()) return epoch;
+                for (Object[] item : pendingOneOff) {
+                    if (((Integer) item[0]).intValue() == epoch) return epoch;
+                }
+                if (!cryptoSend[epoch].pending.isEmpty()) return epoch;
+                if (epoch == QUIC_EPOCH_APPLICATION && (!sendReady.isEmpty() || !creditReady.isEmpty() || pingPending || closing)) return epoch;
+            }
+            return -1;
+        }
+
+        private Object[] _buildPacket() {
+            int epoch = pickEpoch();
+            if (epoch < 0) return null;
+            int budget = maxPacket - headerOverhead(epoch);
+            if (budget < 16) return null;
+            java.util.List<byte[]> frames = new ArrayList<>();
+            Object[] metaCrypto = null;
+            java.util.List<Object[]> metaStreams = new ArrayList<>();
+            boolean metaPing = false;
+            boolean metaClosing = false;
+            boolean metaOneOff = false;
+            if (ackPending[epoch] && !recvRanges[epoch].isEmpty()) {
+                int from = Math.max(0, recvRanges[epoch].size() - 16);
+                byte[] frame = quicEncodeAck(recvRanges[epoch].subList(from, recvRanges[epoch].size()));
+                frames.add(frame);
+                budget -= frame.length;
+                ackPending[epoch] = false;
+            }
+            for (Object[] item : new ArrayList<>(pendingOneOff)) {
+                if (((Integer) item[0]).intValue() != epoch) continue;
+                byte[] f = (byte[]) item[1];
+                if (f.length > budget - 16) break;
+                frames.add(f);
+                budget -= f.length;
+                pendingOneOff.remove(item);
+                metaOneOff = true;
+            }
+            QuicByteSender sender = cryptoSend[epoch];
+            if (!sender.pending.isEmpty() && budget > 16) {
+                QuicRange chunk = sender.take(budget - 12);
+                if (chunk != null) {
+                    byte[] frame = concatBytes(new byte[]{QUIC_FRAME_CRYPTO},
+                            concatBytes(quicWriteVarint(chunk.start), concatBytes(quicWriteVarint(chunk.length), chunk.bytes)));
+                    frames.add(frame);
+                    budget -= frame.length;
+                    metaCrypto = new Object[]{Long.valueOf(chunk.start), Long.valueOf(chunk.length), Boolean.valueOf(chunk.retransmitted)};
+                }
+            }
+            if (epoch == QUIC_EPOCH_APPLICATION) {
+                creditFrames(frames);
+                streamFrames(frames, metaStreams, (int) Math.min((long) budget, Math.max(0, sendWindow() - inFlightBytes())));
+            }
+            if (epoch == QUIC_EPOCH_APPLICATION && closing) {
+                byte[] reason = (closeReason == null ? "close" : closeReason).getBytes(StandardCharsets.UTF_8);
+                if (reason.length > 64) reason = java.util.Arrays.copyOfRange(reason, 0, 64);
+                frames.add(concatBytes(new byte[]{QUIC_FRAME_APPLICATION_CLOSE},
+                        concatBytes(quicWriteVarint(0), concatBytes(quicWriteVarint(0), reason))));
+                metaClosing = true;
+            } else if (epoch == QUIC_EPOCH_APPLICATION && pingPending) {
+                frames.add(new byte[]{QUIC_FRAME_PING});
+                pingPending = false;
+                metaPing = true;
+            }
+            if (frames.isEmpty()) return null;
+            int payloadLen = 0;
+            for (byte[] f : frames) payloadLen += f.length;
+            byte[] payload = new byte[payloadLen];
+            int p = 0;
+            for (byte[] f : frames) {
+                System.arraycopy(f, 0, payload, p, f.length);
+                p += f.length;
+            }
+            if (epoch == QUIC_EPOCH_INITIAL && !handshakeComplete) {
+                // RFC 9000 §14.1: 客户端 Initial 数据报必须填充至 1200 字节
+                int pad = QUIC_MIN_INITIAL - headerOverhead(epoch) - payload.length;
+                if (pad > 0) {
+                    byte[] np = new byte[payload.length + pad];
+                    System.arraycopy(payload, 0, np, 0, payload.length);
+                    payload = np;
+                }
+            }
+            long packetNumber = pnSend[epoch];
+            pnSend[epoch]++;
+            QuicKeys sendKeys = epoch == QUIC_EPOCH_APPLICATION ? appSendKeys[appKeyPhase] : keys[epoch][0];
+            Object[] h = header(epoch, QUIC_PN_LEN + payload.length + 16, packetNumber);
+            byte[] headerBytes = (byte[]) h[0];
+            byte[] pnBytes = (byte[]) h[1];
+            int pnOffset = ((Integer) h[2]).intValue();
+            boolean isLong = ((Boolean) h[3]).booleanValue();
+            byte[] aad = concatBytes(headerBytes, pnBytes);
+            byte[] sealed;
+            try {
+                sealed = concatBytes(aad, sendKeys.seal(packetNumber, aad, payload));
+            } catch (Exception e) {
+                _fail("seal failed: " + e.getMessage());
+                return null;
+            }
+            byte[] protectedPacket = quicApplyProtection(sendKeys, sealed, pnOffset, isLong);
+            if (protectedPacket == null) {
+                _fail("packet too small for header protection sample");
+                return null;
+            }
+            boolean ackEliciting = metaCrypto != null || !metaStreams.isEmpty() || metaPing || metaClosing || metaOneOff;
+            return new Object[]{Integer.valueOf(epoch), protectedPacket, Long.valueOf(packetNumber), metaCrypto, metaStreams,
+                    Boolean.valueOf(ackEliciting)};
+        }
+
+        private void creditFrames(java.util.List<byte[]> frames) {
+            if (creditMaxData) {
+                frames.add(concatBytes(new byte[]{QUIC_FRAME_MAX_DATA}, quicWriteVarint(localMaxData)));
+                creditMaxData = false;
+            }
+            for (QuicStream stream : new ArrayList<>(creditReady)) {
+                frames.add(concatBytes(new byte[]{QUIC_FRAME_MAX_STREAM_DATA},
+                        concatBytes(quicWriteVarint(stream.id), quicWriteVarint(stream.localLimit))));
+                creditReady.remove(stream);
+            }
+        }
+
+        private long peerStreamLimit(QuicStream stream) {
+            if (stream.peerLimit > 0) return stream.peerLimit;
+            return stream.initiator.equals("local") ? peerStreamRemote : peerStreamLocal;
+        }
+
+        private void streamFrames(java.util.List<byte[]> frames, java.util.List<Object[]> metaStreams, int budget) {
+            for (QuicStream stream : new ArrayList<>(sendReady)) {
+                if (budget < 24) break;
+                long credit = Math.min(peerMaxData - connectionSent, peerStreamLimit(stream) - stream.sentEnd);
+                if (credit <= 0) break;
+                QuicRange chunk = stream.send.take(Math.min((long) (budget - 20), credit));
+                if (chunk == null) {
+                    if (stream.send.takeFin()) {
+                        frames.add(concatBytes(new byte[]{QUIC_FRAME_STREAM | 0x04 | 0x02 | 0x01},
+                                concatBytes(quicWriteVarint(stream.id), concatBytes(quicWriteVarint(stream.send.data.length), quicWriteVarint(0)))));
+                        metaStreams.add(new Object[]{stream, Long.valueOf(stream.send.data.length), Long.valueOf(0), Boolean.TRUE, Boolean.FALSE});
+                    } else {
+                        sendReady.remove(stream);
+                    }
+                    continue;
+                }
+                boolean atEnd = chunk.start + chunk.length >= stream.send.data.length;
+                int flags = 0x04 | 0x02 | (atEnd && stream.send.fin ? 0x01 : 0);
+                frames.add(concatBytes(new byte[]{(byte) (QUIC_FRAME_STREAM | flags)},
+                        concatBytes(quicWriteVarint(stream.id), concatBytes(quicWriteVarint(chunk.start),
+                                concatBytes(quicWriteVarint(chunk.length), chunk.bytes)))));
+                metaStreams.add(new Object[]{stream, Long.valueOf(chunk.start), Long.valueOf(chunk.length),
+                        Boolean.valueOf(atEnd && stream.send.fin), Boolean.valueOf(chunk.retransmitted)});
+                long novel = Math.max(0, chunk.start + chunk.length - stream.sentEnd);
+                stream.sentEnd = Math.max(stream.sentEnd, chunk.start + chunk.length);
+                connectionSent += novel;
+                if (stream.send.idle()) sendReady.remove(stream);
+            }
+        }
+
+        private void _transmit(Object[] built) {
+            int epoch = ((Integer) built[0]).intValue();
+            byte[] packet = (byte[]) built[1];
+            long pn = ((Long) built[2]).longValue();
+            Object[] metaCrypto = (Object[]) built[3];
+            @SuppressWarnings("unchecked")
+            java.util.List<Object[]> metaStreams = (java.util.List<Object[]>) built[4];
+            boolean ackEliciting = ((Boolean) built[5]).booleanValue();
+            if (sock == null || closed != null) return;
+            // 调试钩子 (与 js KISAMA_QUIC_DEBUG 同款): dump 前 4 个包的完整字节供协议对表
+            if (System.getenv("KISAMA_QUIC_DEBUG") != null && txDebugCount < 4) {
+                txDebugCount++;
+                logWarning("QUICDBG ep=" + epoch + " pn=" + pn + " hex=" + java.util.HexFormat.of().formatHex(packet));
+            }
+            try {
+                sock.send(new java.net.DatagramPacket(packet, packet.length, sendAddr));
+            } catch (java.io.IOException e) {
+                logDebug("quic send failed: " + e.getMessage());
+            }
+            if (epoch == QUIC_EPOCH_INITIAL) initialSent++;
+            if (epoch == QUIC_EPOCH_HANDSHAKE && cryptoSend[QUIC_EPOCH_HANDSHAKE].pending.isEmpty()) {
+                finishedSent = true;
+            }
+            if (ackEliciting) {
+                boolean retransmitted = false;
+                if (metaCrypto != null && ((Boolean) metaCrypto[2]).booleanValue()) retransmitted = true;
+                for (Object[] item : metaStreams) {
+                    if (((Boolean) item[4]).booleanValue()) retransmitted = true;
+                }
+                java.util.List<Object[]> streams = new ArrayList<>();
+                for (Object[] item : metaStreams) {
+                    streams.add(new Object[]{item[0], item[1], item[2], item[3]});
+                }
+                inFlight[epoch].add(new Object[]{Long.valueOf(pn), Long.valueOf(System.currentTimeMillis()),
+                        Long.valueOf(packet.length), metaCrypto, streams, Boolean.valueOf(retransmitted)});
+                lastEliciting = System.currentTimeMillis();
+            }
+        }
+
+        private void _onDatagram(byte[] message) {
+            // 调试钩子: dump 前 8 个收包 (与 TX 侧 QUICDBG 配对, 供协议对表)
+            if (System.getenv("KISAMA_QUIC_DEBUG") != null && rxDebugCount < 8) {
+                rxDebugCount++;
+                logWarning("QUICRX len=" + message.length + " hex=" + java.util.HexFormat.of().formatHex(message));
+            }
+            lastReceived = System.currentTimeMillis();
+            int offset = 0;
+            while (offset < message.length) {
+                int first = message[offset] & 0xFF;
+                if ((first & 0x80) == 0) {
+                    _handleShort(java.util.Arrays.copyOfRange(message, offset, message.length));
+                    return;
+                }
+                byte[] view = java.util.Arrays.copyOfRange(message, offset, message.length);
+                Object[] parsed = _parseLong(view);
+                if (parsed == null) return;
+                long version = ((Long) parsed[0]).longValue();
+                int type = ((Integer) parsed[1]).intValue();
+                byte[] dcid = (byte[]) parsed[2];
+                byte[] scid = (byte[]) parsed[3];
+                byte[] token = (byte[]) parsed[4];
+                int pnOffset = ((Integer) parsed[5]).intValue();
+                int length = ((Integer) parsed[6]).intValue();
+                boolean retry = ((Boolean) parsed[7]).booleanValue();
+                if (version != QUIC_VERSION) {
+                    logDebug("rx version negotiation or unknown version");
+                    return;
+                }
+                if (type == 3) {
+                    _handleRetry(scid, token);
+                    return;
+                }
+                int end = (int) Math.min((long) view.length, (long) pnOffset + length);
+                _handleLong(java.util.Arrays.copyOfRange(view, 0, end), type, dcid, scid, pnOffset);
+                offset += end;
+            }
+        }
+
+        private Object[] _parseLong(byte[] packet) {
+            if (packet.length < 7) return null;
+            int first = packet[0] & 0xFF;
+            long version = ((long) (packet[1] & 0xFF) << 24) | ((packet[2] & 0xFF) << 16) | ((packet[3] & 0xFF) << 8) | (packet[4] & 0xFF);
+            int type = (first & 0x30) >> 4;
+            int pos = 5;
+            int dcidLen = packet[pos] & 0xFF;
+            pos += 1;
+            if (packet.length - pos < dcidLen + 1) return null;
+            byte[] dcid = java.util.Arrays.copyOfRange(packet, pos, pos + dcidLen);
+            pos += dcidLen;
+            int scidLen = packet[pos] & 0xFF;
+            pos += 1;
+            if (packet.length - pos < scidLen) return null;
+            byte[] scid = java.util.Arrays.copyOfRange(packet, pos, pos + scidLen);
+            pos += scidLen;
+            byte[] token = new byte[0];
+            if (type == 0) {
+                long[] tp = quicReadVarint(packet, pos);
+                if (tp == null) return null;
+                int tokenLen = (int) tp[0];
+                pos += (int) tp[1];
+                if (packet.length - pos < tokenLen) return null;
+                token = java.util.Arrays.copyOfRange(packet, pos, pos + tokenLen);
+                pos += tokenLen;
+            }
+            if (type == 3) {
+                return new Object[]{Long.valueOf(version), Integer.valueOf(type), dcid, scid, token,
+                        Integer.valueOf(0), Integer.valueOf(0), Boolean.TRUE};
+            }
+            long[] lf = quicReadVarint(packet, pos);
+            if (lf == null) return null;
+            int length = (int) lf[0];
+            pos += (int) lf[1];
+            return new Object[]{Long.valueOf(version), Integer.valueOf(type), dcid, scid, token,
+                    Integer.valueOf(pos), Integer.valueOf(length), Boolean.FALSE};
+        }
+
+        private void _handleRetry(byte[] scid, byte[] token) {
+            peerToken = token.clone();
+            peerCid = scid.clone();
+            pnSend[QUIC_EPOCH_INITIAL] = 0;
+            inFlight[QUIC_EPOCH_INITIAL].clear();
+            cryptoSend[QUIC_EPOCH_INITIAL].lossAll();
+            initialSent = 0;
+        }
+
+        private int epochForType(int type) {
+            if (type == 0 || type == 1) return QUIC_EPOCH_INITIAL;
+            return QUIC_EPOCH_HANDSHAKE;
+        }
+
+        private void _handleLong(byte[] packet, int type, byte[] dcid, byte[] scid, int pnOffset) {
+            int epoch = epochForType(type);
+            QuicKeys[] ks = keys[epoch];
+            if (ks == null || packet.length - pnOffset < QUIC_PN_LEN) {
+                stats.put("dropped", Long.valueOf((stats.get("dropped") == null ? 0 : stats.get("dropped").longValue()) + 1));
+                return;
+            }
+            Object[] removed = quicRemoveProtection(ks[1], packet, pnOffset, true);
+            if (removed == null) {
+                stats.put("dropped", Long.valueOf((stats.get("dropped") == null ? 0 : stats.get("dropped").longValue()) + 1));
+                return;
+            }
+            byte[] plainHeader = (byte[]) removed[0];
+            long truncated = ((Long) removed[1]).longValue();
+            int pnLength = (plainHeader[0] & 0x03) + 1;
+            long packetNumber = quicDecodePacketNumber(Math.max(largestRecv[epoch], 0), pnLength * 8, truncated);
+            byte[] payload;
+            try {
+                payload = ks[1].open(packetNumber, plainHeader, java.util.Arrays.copyOfRange(packet, pnOffset + pnLength, packet.length));
+            } catch (Exception e) {
+                stats.put("dropped", Long.valueOf((stats.get("dropped") == null ? 0 : stats.get("dropped").longValue()) + 1));
+                return;
+            }
+            if (epoch == QUIC_EPOCH_INITIAL && java.util.Arrays.equals(dcid, ourCid)) {
+                if (!handshakeComplete && scid.length > 0 && !java.util.Arrays.equals(peerCid, scid)) {
+                    peerCid = scid.clone();
+                }
+            }
+            recordReceived(epoch, packetNumber);
+            if (epoch == QUIC_EPOCH_HANDSHAKE) {
+                _discardEpoch(QUIC_EPOCH_INITIAL, "handshake packet received");
+            }
+            _handleFrames(payload, epoch);
+        }
+
+        private void _handleShort(byte[] packet) {
+            QuicKeys[] ks = keys[QUIC_EPOCH_APPLICATION];
+            if (ks == null) {
+                stats.put("dropped", Long.valueOf((stats.get("dropped") == null ? 0 : stats.get("dropped").longValue()) + 1));
+                return;
+            }
+            if (appRecvGens.isEmpty()) {
+                appRecvGens.add(new Object[]{ks[1], Integer.valueOf(0)});
+            }
+            int pnOffset = 1 + ourCid.length;
+            java.util.List<QuicKeys> headerKeys = new ArrayList<>();
+            headerKeys.add(ks[1]);
+            for (Object[] gen : appRecvGens) {
+                if (!headerKeys.contains(gen[0])) headerKeys.add((QuicKeys) gen[0]);
+            }
+            Object[] newest = appRecvGens.get(0);
+            java.util.List<Object[]> gens = new ArrayList<>(appRecvGens);
+            gens.add(new Object[]{quicNextKeys((QuicKeys) newest[0], false), Integer.valueOf(1 - ((Integer) newest[1]).intValue()), Boolean.TRUE});
+            for (Object[] gen : gens) {
+                QuicKeys gk = (QuicKeys) gen[0];
+                int phase = ((Integer) gen[1]).intValue();
+                boolean isNext = gen.length > 2 && ((Boolean) gen[2]).booleanValue();
+                java.util.List<QuicKeys> candidates = new ArrayList<>(headerKeys);
+                if (isNext) candidates.add(gk);
+                for (QuicKeys hk : candidates) {
+                    Object[] removed = quicRemoveProtection(hk, packet, pnOffset, false);
+                    if (removed == null) continue;
+                    byte[] plainHeader = (byte[]) removed[0];
+                    long truncated = ((Long) removed[1]).longValue();
+                    int pnLength = (plainHeader[0] & 0x03) + 1;
+                    long packetNumber = quicDecodePacketNumber(Math.max(largestRecv[QUIC_EPOCH_APPLICATION], 0), pnLength * 8, truncated);
+                    byte[] payload;
+                    try {
+                        payload = gk.open(packetNumber, plainHeader, java.util.Arrays.copyOfRange(packet, pnOffset + pnLength, packet.length));
+                    } catch (Exception e) {
+                        continue;
+                    }
+                    if (isNext) {
+                        appRecvGens.add(0, new Object[]{gk, Integer.valueOf(phase)});
+                        if (appRecvGens.size() > 2) appRecvGens.remove(appRecvGens.size() - 1);
+                        appKeyPhase = phase;
+                        appSendKeys[phase] = quicNextKeys(appSendKeys[1 - phase], true);
+                    }
+                    recordReceived(QUIC_EPOCH_APPLICATION, packetNumber);
+                    // RFC 9000 §4.1.2: 客户端确认握手只基于 HANDSHAKE_DONE 或 1-RTT 包被 ACK;
+                    // 解密 1-RTT 包本身不确认 — 过急确认会在边缘 coalesce 的 hs+1RTT 数据报里
+                    // 先于待发 handshake-epoch ACK 丢弃握手密钥, 令边缘 ack-eliciting 握手包
+                    // (Finished CRYPTO 包) 永远等不到 ACK 而无限重传 (py 端实机取证)
+                    _handleFrames(payload, QUIC_EPOCH_APPLICATION);
+                    return;
+                }
+            }
+            stats.put("dropped", Long.valueOf((stats.get("dropped") == null ? 0 : stats.get("dropped").longValue()) + 1));
+        }
+
+        private void recordReceived(int epoch, long packetNumber) {
+            recvRanges[epoch] = quicRangesUnion(recvRanges[epoch], java.util.Collections.singletonList(new QuicRange(packetNumber, 1)));
+            if (packetNumber > largestRecv[epoch]) largestRecv[epoch] = packetNumber;
+            ackPending[epoch] = true;
+        }
+
+        private void applyAck(int epoch, List<QuicRange> ranges, long ackDelay) {
+            long now = System.currentTimeMillis();
+            java.util.List<Object[]> sent = new ArrayList<>(inFlight[epoch]);
+            long largestAcked = -1;
+            for (QuicRange r : ranges) largestAcked = Math.max(largestAcked, r.start + r.length - 1);
+            java.util.List<Object[]> keep = new ArrayList<>();
+            long ackedBytes = 0;
+            Long sample = null;
+            for (Object[] entry : sent) {
+                long epn = ((Long) entry[0]).longValue();
+                boolean acked = false;
+                for (QuicRange r : ranges) {
+                    if (epn >= r.start && epn < r.start + r.length) {
+                        acked = true;
+                        break;
+                    }
+                }
+                if (!acked) {
+                    keep.add(entry);
+                    continue;
+                }
+                ackedBytes += ((Long) entry[2]).longValue();
+                if (epn == largestAcked && !((Boolean) entry[5]).booleanValue()) {
+                    sample = Long.valueOf(now - ((Long) entry[1]).longValue() - Math.min(ackDelay, peerMaxAckDelay));
+                }
+                if (entry[3] != null) {
+                    Object[] c = (Object[]) entry[3];
+                    cryptoSend[epoch].ack(((Long) c[0]).longValue(), ((Long) c[1]).longValue(), false);
+                }
+                @SuppressWarnings("unchecked")
+                java.util.List<Object[]> items = (java.util.List<Object[]>) entry[4];
+                for (Object[] item : items) {
+                    ((QuicStream) item[0]).send.ack(((Long) item[1]).longValue(), ((Long) item[2]).longValue(), ((Boolean) item[3]).booleanValue());
+                }
+            }
+            java.util.List<Object[]> survivors = new ArrayList<>();
+            java.util.List<Object[]> lost = new ArrayList<>();
+            for (Object[] entry : keep) {
+                if (largestAcked - ((Long) entry[0]).longValue() >= kPacketThreshold) lost.add(entry);
+                else survivors.add(entry);
+            }
+            inFlight[epoch] = survivors;
+            if (ackedBytes > 0) {
+                if (sample != null && sample.longValue() > 0) recordRttSample(sample.longValue());
+                onSendProgress();
+                growWindow(ackedBytes);
+            }
+            for (Object[] entry : lost) returnLost(epoch, entry);
+            if (!lost.isEmpty()) onLoss(epoch);
+            if (epoch == QUIC_EPOCH_APPLICATION && survivors.size() < sent.size()) _confirmHandshake();
+        }
+
+        private void recordRttSample(long sample) {
+            if (srtt == null) {
+                srtt = Long.valueOf(sample);
+                rttvar = Long.valueOf(sample / 2);
+            } else {
+                rttvar = Long.valueOf((rttvar.longValue() * 3 + Math.abs(srtt.longValue() - sample)) / 4);
+                srtt = Long.valueOf((srtt.longValue() * 7 + sample) / 8);
+            }
+            pto = (int) Math.max(20, Math.round(srtt.longValue() + 4 * rttvar.longValue() + peerMaxAckDelay));
+        }
+
+        private void growWindow(long ackedBytes) {
+            if (congestionWindow < slowStartThreshold) {
+                congestionWindow += ackedBytes;
+            } else {
+                congestionWindow += Math.max(1, maxPacket * ackedBytes / congestionWindow);
+            }
+            congestionWindow = Math.min(congestionWindow, maxWindow);
+        }
+
+        private void onLoss(int epoch) {
+            slowStartThreshold = Math.max(congestionWindow / 2, 2 * minWindow);
+            congestionWindow = minWindow;
+        }
+
+        private void _handleFrames(byte[] payload, int epoch) {
+            int pos = 0;
+            while (pos < payload.length) {
+                int type = payload[pos] & 0xFF;
+                pos++;
+                if (type == QUIC_FRAME_ACK || type == QUIC_FRAME_ACK_ECN) {
+                    Object[] rd = readAckRanges(payload, pos);
+                    @SuppressWarnings("unchecked")
+                    java.util.List<QuicRange> ranges = (java.util.List<QuicRange>) rd[0];
+                    long ackDelay = ((Long) rd[1]).longValue();
+                    pos = ((Integer) rd[2]).intValue();
+                    if (type == QUIC_FRAME_ACK_ECN) {
+                        for (int i = 0; i < 3; i++) {
+                            long[] vp = quicReadVarint(payload, pos);
+                            if (vp == null) return;
+                            pos += (int) vp[1];
+                        }
+                    }
+                    applyAck(epoch, ranges, ackDelay / 1000);
+                    continue;
+                }
+                if (type == QUIC_FRAME_CRYPTO) {
+                    long[] sp = quicReadVarint(payload, pos);
+                    if (sp == null) return;
+                    long start = sp[0];
+                    pos += (int) sp[1];
+                    long[] lp = quicReadVarint(payload, pos);
+                    if (lp == null) return;
+                    int length = (int) lp[0];
+                    pos += (int) lp[1];
+                    if (payload.length - pos < length) return;
+                    byte[] fresh = tlsOffsets[epoch].accept(start, java.util.Arrays.copyOfRange(payload, pos, pos + length));
+                    pos += length;
+                    if (fresh.length > 0) consumeTls(epoch, fresh);
+                    continue;
+                }
+                if ((type & 0xF8) == QUIC_FRAME_STREAM) {
+                    int flags = type & 0x07;
+                    long[] ip = quicReadVarint(payload, pos);
+                    if (ip == null) return;
+                    long streamId = ip[0];
+                    pos += (int) ip[1];
+                    boolean hasLength = (flags & 0x02) != 0;
+                    boolean hasOffset = (flags & 0x04) != 0;
+                    boolean fin = (flags & 0x01) != 0;
+                    long offset = 0;
+                    if (hasOffset) {
+                        long[] op = quicReadVarint(payload, pos);
+                        if (op == null) return;
+                        offset = op[0];
+                        pos += (int) op[1];
+                    }
+                    int length = payload.length - pos;
+                    if (hasLength) {
+                        long[] lp = quicReadVarint(payload, pos);
+                        if (lp == null) return;
+                        length = (int) lp[0];
+                        pos += (int) lp[1];
+                    }
+                    if (payload.length - pos < length) return;
+                    deliverStream(streamId, offset, java.util.Arrays.copyOfRange(payload, pos, pos + length), fin);
+                    pos += length;
+                    continue;
+                }
+                if (type == QUIC_FRAME_MAX_DATA) {
+                    long[] vp = quicReadVarint(payload, pos);
+                    if (vp == null) return;
+                    peerMaxData = Math.max(peerMaxData, vp[0]);
+                    pos += (int) vp[1];
+                    continue;
+                }
+                if (type == QUIC_FRAME_MAX_STREAM_DATA) {
+                    long[] ip = quicReadVarint(payload, pos);
+                    if (ip == null) return;
+                    long id = ip[0];
+                    pos += (int) ip[1];
+                    QuicStream stream = streams.get(Long.valueOf(id));
+                    if (stream != null) {
+                        long[] vp = quicReadVarint(payload, pos);
+                        if (vp == null) return;
+                        stream.peerLimit = Math.max(stream.peerLimit, vp[0]);
+                        pos += (int) vp[1];
+                    } else {
+                        long[] vp = quicReadVarint(payload, pos);
+                        if (vp == null) return;
+                        pos += (int) vp[1];
+                    }
+                    continue;
+                }
+                if (type == QUIC_FRAME_MAX_STREAMS_BIDI || type == QUIC_FRAME_MAX_STREAMS_UNI) {
+                    long[] vp = quicReadVarint(payload, pos);
+                    if (vp == null) return;
+                    pos += (int) vp[1];
+                    continue;
+                }
+                if (type == QUIC_FRAME_NEW_CONNECTION_ID) {
+                    long[] p1 = quicReadVarint(payload, pos);
+                    if (p1 == null) return;
+                    pos += (int) p1[1];
+                    long[] p2 = quicReadVarint(payload, pos);
+                    if (p2 == null) return;
+                    pos += (int) p2[1];
+                    if (pos >= payload.length) return;
+                    int cidLen = payload[pos] & 0xFF;
+                    pos += 1;
+                    if (payload.length - pos < cidLen + 16) return;
+                    pos += cidLen + 16;
+                    continue;
+                }
+                if (type == QUIC_FRAME_RETIRE_CONNECTION_ID) {
+                    long[] vp = quicReadVarint(payload, pos);
+                    if (vp == null) return;
+                    pos += (int) vp[1];
+                    continue;
+                }
+                if (type == QUIC_FRAME_PATH_CHALLENGE) {
+                    if (payload.length - pos < 8) return;
+                    byte[] data = java.util.Arrays.copyOfRange(payload, pos, pos + 8);
+                    pos += 8;
+                    pendingOneOff.add(new Object[]{Integer.valueOf(epoch), concatBytes(new byte[]{QUIC_FRAME_PATH_RESPONSE}, data)});
+                    continue;
+                }
+                if (type == QUIC_FRAME_PATH_RESPONSE) continue;
+                if (type == QUIC_FRAME_HANDSHAKE_DONE) {
+                    _confirmHandshake();
+                    continue;
+                }
+                if (type == QUIC_FRAME_RESET_STREAM) {
+                    long[] ip = quicReadVarint(payload, pos);
+                    if (ip == null) return;
+                    pos += (int) ip[1];
+                    for (int i = 0; i < 2; i++) {
+                        long[] vp = quicReadVarint(payload, pos);
+                        if (vp == null) return;
+                        pos += (int) vp[1];
+                    }
+                    QuicStream stream = streams.get(Long.valueOf(ip[0]));
+                    if (stream != null) {
+                        stream.reset = true;
+                        onStreamEnd.accept(stream);
+                    }
+                    continue;
+                }
+                if (type == QUIC_FRAME_STOP_SENDING) {
+                    for (int i = 0; i < 2; i++) {
+                        long[] vp = quicReadVarint(payload, pos);
+                        if (vp == null) return;
+                        pos += (int) vp[1];
+                    }
+                    continue;
+                }
+                if (type == QUIC_FRAME_NEW_TOKEN) {
+                    long[] lp = quicReadVarint(payload, pos);
+                    if (lp == null) return;
+                    int length = (int) lp[0];
+                    pos += (int) lp[1];
+                    if (payload.length - pos < length) return;
+                    peerToken = java.util.Arrays.copyOfRange(payload, pos, pos + length);
+                    pos += length;
+                    continue;
+                }
+                if (type == QUIC_FRAME_TRANSPORT_CLOSE || type == QUIC_FRAME_APPLICATION_CLOSE) {
+                    long[] cp = quicReadVarint(payload, pos);
+                    if (cp == null) return;
+                    long code = cp[0];
+                    pos += (int) cp[1];
+                    if (type == QUIC_FRAME_TRANSPORT_CLOSE) {
+                        long[] fp = quicReadVarint(payload, pos);
+                        if (fp == null) return;
+                        pos += (int) fp[1];
+                    }
+                    String reason = pos < payload.length ? new String(payload, pos, payload.length - pos, StandardCharsets.UTF_8) : "";
+                    _fail("peer closed code=" + code + " reason=" + reason);
+                    return;
+                }
+                if (type == QUIC_FRAME_DATAGRAM || type == QUIC_FRAME_DATAGRAM_LEN) {
+                    int length = payload.length - pos;
+                    if (type == QUIC_FRAME_DATAGRAM_LEN) {
+                        long[] lp = quicReadVarint(payload, pos);
+                        if (lp == null) return;
+                        length = (int) lp[0];
+                        pos += (int) lp[1];
+                    }
+                    if (payload.length - pos < length) return;
+                    pos += length;
+                    continue;
+                }
+                _fail("unhandled QUIC frame type 0x" + Integer.toHexString(type));
+                return;
+            }
+        }
+
+        private Object[] readAckRanges(byte[] payload, int pos) {
+            java.util.List<QuicRange> out = new ArrayList<>();
+            long[] p1 = quicReadVarint(payload, pos);
+            if (p1 == null) return new Object[]{out, Long.valueOf(0), Integer.valueOf(pos)};
+            long largest = p1[0];
+            pos += (int) p1[1];
+            long[] p2 = quicReadVarint(payload, pos);
+            if (p2 == null) return new Object[]{out, Long.valueOf(0), Integer.valueOf(pos)};
+            long ackDelay = p2[0];
+            pos += (int) p2[1];
+            long[] p3 = quicReadVarint(payload, pos);
+            if (p3 == null) return new Object[]{out, Long.valueOf(0), Integer.valueOf(pos)};
+            long rangeCount = p3[0];
+            pos += (int) p3[1];
+            long[] p4 = quicReadVarint(payload, pos);
+            if (p4 == null) return new Object[]{out, Long.valueOf(0), Integer.valueOf(pos)};
+            long first = p4[0];
+            pos += (int) p4[1];
+            out.add(new QuicRange(largest - first, first + 1));
+            long smallest = largest - first;
+            for (int i = 0; i < rangeCount; i++) {
+                long[] g = quicReadVarint(payload, pos);
+                if (g == null) break;
+                long gap = g[0];
+                pos += (int) g[1];
+                long[] l = quicReadVarint(payload, pos);
+                if (l == null) break;
+                long length = l[0];
+                pos += (int) l[1];
+                long end = smallest - gap - 2;
+                out.add(new QuicRange(end - length, length + 1));
+                smallest = end - length;
+            }
+            return new Object[]{out, Long.valueOf(ackDelay), Integer.valueOf(pos)};
+        }
+
+        private void deliverStream(long streamId, long offset, byte[] bytes, boolean fin) {
+            QuicStream stream = streams.get(Long.valueOf(streamId));
+            if (stream == null) {
+                stream = new QuicStream(this, streamId, (streamId & 1) == 1 ? "remote" : "local");
+                streams.put(Long.valueOf(streamId), stream);
+                onStream.accept(stream);
+            }
+            byte[] fresh = stream.receiver.accept(offset, bytes);
+            if (fresh.length > 0) {
+                byte[] old = stream.recv;
+                stream.recv = new byte[old.length + fresh.length];
+                System.arraycopy(old, 0, stream.recv, 0, old.length);
+                System.arraycopy(fresh, 0, stream.recv, old.length, fresh.length);
+                consumedTotal += fresh.length;
+                if (localMaxData - consumedTotal < receiveWindow / 2) {
+                    localMaxData = consumedTotal + receiveWindow;
+                    creditMaxData = true;
+                }
+                if (stream.localLimit - stream.recv.length < receiveWindow / 2) {
+                    stream.localLimit = stream.recv.length + receiveWindow;
+                    if (!creditReady.contains(stream)) creditReady.add(stream);
+                }
+                onStreamData.accept(stream, fresh);
+                _tick();
+            }
+            if (fin && !stream.ended && stream.receiver.contiguous == stream.recv.length) {
+                stream.ended = true;
+                onStreamEnd.accept(stream);
+            }
+        }
+
+        private void consumeTls(int epoch, byte[] payload) {
+            if (epoch == QUIC_EPOCH_APPLICATION) return;
+            if (epoch == QUIC_EPOCH_INITIAL && tls.state.equals("awaiting-server-hello")) {
+                serverHello = concatBytes(serverHello, payload);
+                byte[] message;
+                try {
+                    message = tls.serverHelloComplete(serverHello);
+                    if (message == null) return;
+                    serverHello = new byte[0];
+                    Object[] ks = tls.handleServerHello(message);
+                    keys[QUIC_EPOCH_HANDSHAKE] = new QuicKeys[]{(QuicKeys) ks[0], (QuicKeys) ks[1]};
+                } catch (Exception e) {
+                    _fail("server hello: " + e.getMessage());
+                    return;
+                }
+                logDebug("quic server hello received, handshake keys installed");
+                return;
+            }
+            // RFC 9001: ServerHello 之后的 flight 应为 Handshake epoch; 但边缘实机行为
+            // 是把整个 flight 继续用 Initial epoch 发送 — 两处来源统一汇入同一条 TLS 流
+            handshakeBytes = concatBytes(handshakeBytes, payload);
+            pumpHandshakeMessages();
+        }
+
+        private void pumpHandshakeMessages() {
+            while (handshakeBytes.length >= 4) {
+                int total = 4 + intFrom3Bytes(handshakeBytes, 1);
+                if (handshakeBytes.length < total) return;
+                byte[] message = java.util.Arrays.copyOfRange(handshakeBytes, 0, total);
+                handshakeBytes = java.util.Arrays.copyOfRange(handshakeBytes, total, handshakeBytes.length);
+                Object[] result;
+                try {
+                    result = tls.handleHandshakeMessage(message);
+                } catch (Exception e) {
+                    _fail("handshake message: " + e.getMessage());
+                    return;
+                }
+                if (tls.remoteParameters != null && remoteParameters == null) {
+                    remoteParameters = tls.remoteParameters;
+                    peerMaxData = remoteParameters[QUIC_PARAM_INITIAL_MAX_DATA];
+                    peerStreamRemote = remoteParameters[QUIC_PARAM_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE];
+                    peerStreamLocal = remoteParameters[QUIC_PARAM_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL];
+                    long mad = remoteParameters[QUIC_PARAM_MAX_ACK_DELAY];
+                    peerMaxAckDelay = Math.min(mad == 0 ? 25 : mad, 100);
+                }
+                if (result != null) {
+                    if (verifyCertificate) {
+                        String verifyError = verifyEdgeQuicCertificate(tls.leafCert);
+                        if (verifyError != null) {
+                            _fail("edge certificate verification failed: " + verifyError);
+                            return;
+                        }
+                    }
+                    keys[QUIC_EPOCH_APPLICATION] = new QuicKeys[]{(QuicKeys) result[2], (QuicKeys) result[3]};
+                    appRecvGens.clear();
+                    appRecvGens.add(new Object[]{result[3], Integer.valueOf(0)});
+                    appSendKeys[0] = (QuicKeys) result[2];
+                    cryptoSend[QUIC_EPOCH_HANDSHAKE].append((byte[]) result[1], false);
+                    handshakeComplete = true;
+                    if (!((Boolean) result[0]).booleanValue()) logWarning("server Finished verify_data mismatch");
+                    logDebug("quic handshake complete alpn=" + (tls.negotiatedAlpn == null ? "?" : tls.negotiatedAlpn));
+                    handshakeEvent.countDown();
+                    return;
+                }
+            }
+        }
+
+        private void _fail(String message) {
+            if (closed != null) return;
+            logDebug("quic closed: " + message);
+            _finish(message);
+        }
+
+        private void _finish(String err) {
+            if (closed != null) return;
+            closed = err == null ? "closed" : err;
+            if (sock != null) {
+                try { sock.close(); } catch (Exception ignored) {}
+                sock = null;
+            }
+            if (!handshakeComplete) {
+                handshakeEvent.countDown();
+            } else {
+                onClose.accept(err);
+            }
+        }
+    }
+
+    private static Object connectEdgeQuic(Object logger, long idleTimeoutMs, boolean verifyCertificate) throws Exception {
+        java.util.List<String> candidates = new ArrayList<>();
+        for (String h : EDGE_HOSTS) candidates.add(h);
+        java.util.Collections.shuffle(candidates);
+        String lastError = null;
+        for (String host : candidates) {
+            QuicConnection connection = new QuicConnection(host, EDGE_PORT, logger,
+                    QUIC_SERVER_NAME, QUIC_ALPN, idleTimeoutMs > 0 ? idleTimeoutMs : 30000, verifyCertificate);
+            try {
+                connection.connect(20000);
+                try { logger.getClass().getMethod("info", String.class).invoke(logger, "connected to " + host + ":" + EDGE_PORT + " over QUIC"); } catch (Exception ignored) {}
+                return connection;
+            } catch (Exception e) {
+                lastError = e.getMessage();
+                try { logger.getClass().getMethod("warning", String.class).invoke(logger, "edge " + host + " failed: " + e.getMessage()); } catch (Exception ignored) {}
+                try { connection.close("edge connect failed"); } catch (Exception ignored) {}
+            }
+        }
+        throw new java.io.IOException("all Cloudflare edges failed: " + lastError);
+    }
+
     private static final class ControlStream {
         final H2Connection connection;
         final int streamId;
@@ -5134,6 +8873,11 @@ public class kisama {
             for (byte[] message : parsed.messages) {
                 try {
                     CapnpReturnResult result = capnpReturnResult(message);
+                    if (!result.ok && "bootstrap".equals(result.error)) {
+                        // bootstrap 应答 (Payload.content = capability): 非注册结果, 静默跳过
+                        // (py/js 同语义) — 误判为注册失败会停掉连接, 永远等不到 register 应答
+                        continue;
+                    }
                     if (result.ok) {
                         connection.agent.log("[TRACE-ARGO] ✅ 隧道连接已在边缘注册: "
                                 + (result.location != null ? result.location : "unknown"));
@@ -5325,12 +9069,583 @@ public class kisama {
     }
 
     // ==================== 🌟 Argo 临时隧道管理器 (与 js/agent.js 语义一致) ====================
+    // ==================== QUIC 隧道数据面 (对齐 py/js QuicSession) ====================
+    // 控制流注册语义与 h2 ControlStream 一致 (bootstrap → register → Return 应答);
+    // 边缘发起双向流 (id&3==1) 携带 7B 前导 + ConnectRequest, HTTP 经 proxyToOrigin 代理,
+    // websocket 类型 101 状态经 ConnectResponse metadata 字面转发 (实机取证), 裸字节双向转发。
+    private static final int QUIC_CONNECTION_TYPE_HTTP = 0;
+    private static final int QUIC_CONNECTION_TYPE_WEBSOCKET = 1;
+    private static final int QUIC_CONNECTION_TYPE_TCP = 2;
+
+    private static long[] capnpWords(byte[] data) {
+        long[] words = new long[data.length / 8];
+        for (int i = 0; i < words.length; i++) {
+            long w = 0;
+            for (int j = 0; j < 8; j++) {
+                w |= (data[i * 8 + j] & 0xFFL) << (j * 8);
+            }
+            words[i] = w;
+        }
+        return words;
+    }
+
+    // composite struct list (list type 7) of two Text fields — ConnectRequest.metadata (key, value)
+    private static List<String[]> capnpStructList(long[] words, int pointerWord) {
+        if (pointerWord >= words.length) return null;
+        long pointer = words[pointerWord];
+        if ((pointer & 3L) != 1L || ((pointer >>> 32) & 7L) != 7L) return null;
+        long offset = (pointer >>> 2) & 0x3FFFFFFFL;
+        if ((offset & 0x20000000L) != 0) offset -= 0x40000000L;
+        int target = (int) (pointerWord + 1 + offset);
+        long elementWords = pointer >>> 35;
+        if (target < 0 || target >= words.length) return null;
+        long tag = words[target];
+        if ((tag & 3L) != 0L) return null;
+        int dataWords = (int) ((tag >>> 32) & 0xFFFFL);
+        int pointerWords = (int) ((tag >>> 48) & 0xFFFFL);
+        int count = (int) ((tag >>> 2) & 0x3FFFFFFFL);
+        int stride = dataWords + pointerWords;
+        if (pointerWords < 2 || stride == 0 || (long) stride * count != elementWords) return null;
+        if (target + 1 + stride * count > words.length) return null;
+        List<String[]> elements = new ArrayList<>();
+        for (int index = 0; index < count; index++) {
+            int base = target + 1 + index * stride;
+            elements.add(new String[]{capnpText(words, base + dataWords), capnpText(words, base + dataWords + 1)});
+        }
+        return elements;
+    }
+
+    private static QuicConnectRequest capnpConnectRequest(byte[] data) {
+        long[] words = capnpWords(data);
+        if (words.length == 0) throw new IllegalStateException("empty Cap'n Proto ConnectRequest");
+        int[] struct = capnpStruct(words, 0);
+        int target = struct[0], dataWords = struct[1], pointerWords = struct[2];
+        if (dataWords < 1 || pointerWords < 2) throw new IllegalStateException("unexpected ConnectRequest layout");
+        QuicConnectRequest out = new QuicConnectRequest();
+        out.dest = capnpText(words, target + dataWords);
+        out.type = (int) (words[target] & 0xFFFFL);
+        List<String[]> metadata = capnpStructList(words, target + dataWords + 1);
+        out.metadata = metadata != null ? metadata : new ArrayList<>();
+        return out;
+    }
+
+    // ConnectResponse: errorText 非空表示该流被拒绝; metadata 携带 (HttpStatus, HttpHeader:name)
+    // 响应头, 之后同流继续写原始响应体 (websocket 类型随后进入裸字节双向转发)。
+    private static byte[] capnpConnectResponse(String errorText, List<String[]> metadata) {
+        CapnpBuilder msg = new CapnpBuilder();
+        int root = msg.alloc(1), body = msg.alloc(2);
+        msg.structPtr(root, body, 0, 2);
+        msg.writeBytes(body, (errorText == null ? "" : errorText).getBytes(StandardCharsets.UTF_8), true);
+        msg.writeStructList(body + 1, metadata);
+        return msg.finish();
+    }
+
+    private static final class QuicConnectRequest {
+        String dest;
+        int type;
+        List<String[]> metadata = new ArrayList<>();
+    }
+
+    private static final class QuicRequest {
+        int type;
+        String method = "GET";
+        String host = "";
+        String path = "/";
+        List<String[]> headers = new ArrayList<>();
+        Long contentLength = null;
+        boolean bodyless;
+    }
+
+    private static QuicRequest buildQuicRequest(QuicConnectRequest connect) {
+        QuicRequest out = new QuicRequest();
+        out.type = connect.type;
+        List<String[]> headers = new ArrayList<>();
+        Map<String, String> metadata = new LinkedHashMap<>();
+        for (String[] pair : connect.metadata) {
+            if (pair[0] != null && pair[0].contains(":")) {
+                String[] parts = pair[0].split(":");
+                if (parts.length != 2) throw new IllegalStateException("header Key: " + pair[0] + " malformed");
+                headers.add(new String[]{parts[1], pair[1]});
+            } else {
+                metadata.put(pair[0], pair[1]);
+            }
+        }
+        String requestPath = connect.dest;
+        try {
+            java.net.URI parsed = java.net.URI.create(connect.dest);
+            requestPath = parsed.getRawPath() == null || parsed.getRawPath().isEmpty() ? "/" : parsed.getRawPath();
+            if (parsed.getRawQuery() != null && !parsed.getRawQuery().isEmpty()) {
+                requestPath += "?" + parsed.getRawQuery();
+            }
+        } catch (Exception ignored) {
+        }
+        String method = metadata.get(QUIC_META_METHOD);
+        out.method = method != null && !method.isEmpty() ? method : "GET";
+        String host = metadata.get(QUIC_META_HOST);
+        out.host = host != null ? host : "";
+        out.path = requestPath.startsWith("/") ? requestPath : "/" + requestPath;
+        out.headers = headers;
+        boolean chunked = false;
+        for (String[] pair : headers) {
+            String lower = pair[0].toLowerCase(Locale.ROOT);
+            if ("content-length".equals(lower) && out.contentLength == null && pair[1].matches("\\d+")) {
+                out.contentLength = Long.parseLong(pair[1]);
+            } else if ("transfer-encoding".equals(lower) && pair[1].toLowerCase(Locale.ROOT).contains("chunked")) {
+                chunked = true;
+            }
+        }
+        out.bodyless = !chunked && out.contentLength == null;
+        return out;
+    }
+
+    private static final class QuicRequestState {
+        final QuicStream stream;
+        final ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        final ByteArrayOutputStream body = new ByteArrayOutputStream();
+        QuicRequest request = null;
+        QuicWebsocketRelay relay = null;
+        boolean websocket = false;
+        boolean ended = false;
+        boolean served = false;
+        boolean failed = false;
+
+        QuicRequestState(QuicStream stream) {
+            this.stream = stream;
+        }
+    }
+
+    private final class QuicArgoSession {
+        final QuicConnection conn;
+        final String origin;
+        final String accountTag;
+        final byte[] tunnelSecret;
+        final byte[] tunnelId;
+        final int connIndex;
+        QuicControlStream control = null;
+        final Map<Long, QuicRequestState> requests = new ConcurrentHashMap<>();
+        final java.util.Set<QuicWebsocketRelay> relays = ConcurrentHashMap.newKeySet();
+        volatile boolean stopped = false;
+        final java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(1);
+        volatile String error = null;
+
+        QuicArgoSession(QuicConnection conn, String origin, String accountTag, byte[] tunnelSecret, byte[] tunnelId,
+                        int connIndex) {
+            this.conn = conn;
+            this.origin = origin;
+            this.accountTag = accountTag;
+            this.tunnelSecret = tunnelSecret;
+            this.tunnelId = tunnelId;
+            this.connIndex = connIndex;
+            conn.onStream = this::acceptStream;
+            conn.onStreamData = this::receiveStream;
+            conn.onStreamEnd = this::endStream;
+            conn.onClose = this::stop;
+        }
+
+        // 边缘约定首个客户端发起流为控制面; 阻塞直至连接关闭 (关闭异常向上抛)
+        void run() throws Exception {
+            QuicStream stream = conn.openStream();
+            control = new QuicControlStream(conn, stream.id);
+            control.start(accountTag, tunnelSecret, tunnelId, connIndex);
+            done.await();
+            if (error != null) throw new java.io.IOException(error);
+        }
+
+        void stop(String err) {
+            if (stopped) return;
+            stopped = true;
+            requests.clear();
+            for (QuicWebsocketRelay relay : relays.toArray(new QuicWebsocketRelay[0])) {
+                relay.stop();
+            }
+            relays.clear();
+            error = err;
+            done.countDown();
+        }
+
+        void acceptStream(QuicStream stream) {
+            // 边缘发起的双向流承载请求 (id&3==1); 偶数 id 是我方发起
+            if ((stream.id & 3L) != 1L) return;
+            requests.put(Long.valueOf(stream.id), new QuicRequestState(stream));
+        }
+
+        void receiveStream(QuicStream stream, byte[] data) {
+            if (control != null && stream.id == control.streamId) {
+                control.feed(data);
+                return;
+            }
+            QuicRequestState state = requests.get(Long.valueOf(stream.id));
+            if (state == null || state.failed) return;
+            if (state.request == null) {
+                state.buffer.write(data, 0, data.length);
+                parseRequest(state);
+            } else if (data.length > 0) {
+                if (state.websocket && state.relay != null) {
+                    state.relay.feed(data);
+                } else {
+                    state.body.write(data, 0, data.length);
+                }
+            }
+            maybeServe(state);
+        }
+
+        void endStream(QuicStream stream) {
+            if (control != null && stream.id == control.streamId) {
+                control.finished = true;
+                return;
+            }
+            QuicRequestState state = requests.get(Long.valueOf(stream.id));
+            if (state == null) return;
+            state.ended = true;
+            if (state.websocket && state.relay != null) {
+                state.relay.feedEnd();
+                return;
+            }
+            if (state.request != null) maybeServe(state);
+            else requests.remove(Long.valueOf(stream.id));
+        }
+
+        void parseRequest(QuicRequestState state) {
+            byte[] buffer = state.buffer.toByteArray();
+            if (buffer.length < QUIC_DATA_STREAM_PREAMBLE.length) return;
+            for (int i = 0; i < QUIC_DATA_STREAM_PREAMBLE.length; i++) {
+                if (buffer[i] != QUIC_DATA_STREAM_PREAMBLE[i]) {
+                    logWarn("[TRACE-ARGO] ⚠️ QUIC 流 " + state.stream.id + " 不是 v1 tunnel data stream");
+                    state.failed = true;
+                    return;
+                }
+            }
+            if (buffer[6] != '0' || buffer[7] != '1') {
+                logWarn("[TRACE-ARGO] ⚠️ QUIC 流 " + state.stream.id + " 使用隧道协议版本 "
+                        + new String(buffer, 6, 2, StandardCharsets.US_ASCII));
+                state.failed = true;
+                return;
+            }
+            CapnpMessagesResult parsed = capnpMessages(
+                    Arrays.copyOfRange(buffer, QUIC_DATA_STREAM_PREAMBLE.length, buffer.length));
+            if (parsed.messages.isEmpty()) return;
+            QuicConnectRequest connect;
+            try {
+                connect = capnpConnectRequest(parsed.messages.get(0));
+            } catch (Exception exc) {
+                logWarn("[TRACE-ARGO] ⚠️ QUIC 流 " + state.stream.id + " ConnectRequest 不可解析: " + exc.getMessage());
+                state.failed = true;
+                return;
+            }
+            state.buffer.reset();
+            state.body.write(parsed.rest, 0, parsed.rest.length);
+            try {
+                state.request = buildQuicRequest(connect);
+                state.websocket = state.request.type == QUIC_CONNECTION_TYPE_WEBSOCKET;
+            } catch (Exception exc) {
+                logWarn("[TRACE-ARGO] ⚠️ QUIC 流 " + state.stream.id + ": " + exc.getMessage());
+                state.failed = true;
+                respond(state, String.valueOf(exc.getMessage()), 502);
+            }
+        }
+
+        void maybeServe(QuicRequestState state) {
+            if (state.served || state.request == null || state.failed || !quicRequestComplete(state)) return;
+            state.served = true;
+            serveRequest(state);
+        }
+
+        boolean quicRequestComplete(QuicRequestState state) {
+            QuicRequest request = state.request;
+            if (request.bodyless) return true;
+            if (state.ended) return true;
+            return request.contentLength != null && state.body.size() >= request.contentLength;
+        }
+
+        void serveRequest(QuicRequestState state) {
+            QuicRequest request = state.request;
+            if (request.type == QUIC_CONNECTION_TYPE_WEBSOCKET) {
+                serveWebsocket(state);
+                return;
+            }
+            if (request.type != QUIC_CONNECTION_TYPE_HTTP) {
+                Thread t = new Thread(() -> respond(state,
+                        "tunnel connection type " + request.type + " is not proxied over QUIC yet", 502));
+                t.setDaemon(true);
+                t.start();
+                return;
+            }
+            // 与 h2 路径一致: 代理在独立线程执行, 不阻塞读循环 (ACK/重传照常推进)
+            Thread t = new Thread(() -> proxyHttp(state), "argo-quic-" + state.stream.id);
+            t.setDaemon(true);
+            t.start();
+        }
+
+        void proxyHttp(QuicRequestState state) {
+            QuicStream stream = state.stream;
+            QuicRequest request = state.request;
+            try {
+                HttpProxyResponse response = proxyToOrigin(origin, request.method, request.path, request.headers,
+                        state.body.toByteArray());
+                List<String[]> metadata = new ArrayList<>();
+                metadata.add(new String[]{QUIC_META_STATUS,
+                        String.valueOf(response.status == 101 ? 200 : response.status)});
+                boolean hasContentType = false;
+                for (String[] pair : response.headers) {
+                    String lower = pair[0].toLowerCase(Locale.ROOT);
+                    if ("transfer-encoding".equals(lower)) continue;
+                    if ("content-type".equals(lower)) hasContentType = true;
+                    metadata.add(new String[]{QUIC_META_HEADER + ":" + pair[0], pair[1]});
+                }
+                if (!hasContentType) {
+                    String inferred = inferContentType(request.path);
+                    if (!inferred.isEmpty()) {
+                        metadata.add(new String[]{QUIC_META_HEADER + ":Content-Type", inferred});
+                    }
+                }
+                writeResponse(stream, "", metadata, false);
+                InputStream in = response.body;
+                byte[] chunk = new byte[65536];
+                int n;
+                while ((n = in.read(chunk)) != -1) {
+                    stream.write(Arrays.copyOf(chunk, n), false);
+                }
+                stream.write(new byte[0], true);
+            } catch (Exception exc) {
+                logWarn("[TRACE-ARGO] ⚠️ QUIC 流 " + stream.id + " 代理失败: " + exc.getMessage());
+                respond(state, String.valueOf(exc.getMessage()), 502);
+            } finally {
+                if (!state.websocket) requests.remove(Long.valueOf(stream.id));
+            }
+        }
+
+        void serveWebsocket(QuicRequestState state) {
+            QuicWebsocketRelay relay = new QuicWebsocketRelay(this, state);
+            state.relay = relay;
+            relays.add(relay);
+            Thread t = new Thread(relay::run, "argo-quic-ws-" + state.stream.id);
+            t.setDaemon(true);
+            t.start();
+        }
+
+        void respond(QuicRequestState state, String errorText, int status) {
+            List<String[]> metadata = new ArrayList<>();
+            metadata.add(new String[]{QUIC_META_STATUS, String.valueOf(status)});
+            writeResponse(state.stream, errorText, metadata, true);
+        }
+
+        void writeResponse(QuicStream stream, String errorText, List<String[]> metadata, boolean endStream) {
+            if (stopped || stream.send.fin) return;
+            stream.write(concatBytes(QUIC_DATA_STREAM_PREAMBLE, capnpConnectResponse(errorText, metadata)), endStream);
+        }
+
+        // QUIC 控制流: 注册语义与 h2 ControlStream.feed 逐字对齐 (bootstrap 应答由
+        // capnpReturnResult 抛出、按忽略计数), registered/registrationFailed 供守护线程判定
+        private final class QuicControlStream {
+            final QuicConnection connection;
+            final long streamId;
+            final ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+            volatile boolean finished = false;
+
+            QuicControlStream(QuicConnection connection, long streamId) {
+                this.connection = connection;
+                this.streamId = streamId;
+            }
+
+            void start(String accountTag, byte[] secret, byte[] tunnelId, int connIndex) {
+                connection.sendData(streamId, capnpBootstrap(0), false);
+                connection.sendData(streamId, capnpRegister(1, 0, accountTag, secret, tunnelId, connIndex), false);
+            }
+
+            void feed(byte[] payload) {
+                buffer.write(payload, 0, payload.length);
+                CapnpMessagesResult parsed = capnpMessages(buffer.toByteArray());
+                byte[] rest = parsed.rest;
+                buffer.reset();
+                buffer.write(rest, 0, rest.length);
+                for (byte[] message : parsed.messages) {
+                try {
+                    CapnpReturnResult result = capnpReturnResult(message);
+                    if (!result.ok && "bootstrap".equals(result.error)) {
+                        // bootstrap 应答 (Payload.content = capability): 非注册结果, 静默跳过
+                        // (py/js 同语义) — 误判为注册失败会停掉连接, 永远等不到 register 应答
+                        continue;
+                    }
+                    if (result.ok) {
+                        log("[TRACE-ARGO] ✅ 隧道连接已在边缘注册: "
+                                + (result.location != null ? result.location : "unknown"));
+                        connection.registered = true;
+                        } else {
+                            logWarn("[TRACE-ARGO] ⚠️ 隧道注册失败: "
+                                    + (result.error != null ? result.error : "unknown error"));
+                            // 🛡️ 注册失败: 结束本轮连接, 由守护线程计数, 连续失败达阈值后自动重新注册换新域名
+                            connection.registrationFailed = true;
+                            connection.setStopped(true);
+                        }
+                    } catch (Exception e) {
+                        log("[TRACE-ARGO] 忽略控制 RPC 消息: " + e.getMessage());
+                    }
+                }
+            }
+        }
+    }
+
+    // QUIC websocket 中继: ConnectRequest(type=1) 的响应头经 ConnectResponse metadata 交付
+    // (状态字面转发 101, 实机确认; 响应体/WS 帧走裸字节双向转发)
+    private final class QuicWebsocketRelay {
+        final QuicArgoSession session;
+        final QuicRequestState state;
+        final java.util.concurrent.LinkedBlockingQueue<byte[]> queue = new java.util.concurrent.LinkedBlockingQueue<>();
+        volatile boolean stopped = false;
+        java.net.Socket sock = null;
+
+        QuicWebsocketRelay(QuicArgoSession session, QuicRequestState state) {
+            this.session = session;
+            this.state = state;
+        }
+
+        void feed(byte[] payload) {
+            if (payload.length > 0) queue.offer(payload);
+        }
+
+        void feedEnd() {
+            queue.offer(new byte[0]);   // 边缘侧 FIN
+        }
+
+        void stop() {
+            if (stopped) return;
+            stopped = true;
+            queue.offer(new byte[0]);
+            if (sock != null) {
+                try {
+                    sock.close();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+
+        void run() {
+            Thread writer = null;
+            try {
+                sock = openOriginSocket(session.origin);
+                sendHandshake();
+                Http1Response response = readHttp1Response(sock);
+                if (response.status != 101) {
+                    List<String[]> meta = new ArrayList<>();
+                    meta.add(new String[]{QUIC_META_STATUS, String.valueOf(response.status)});
+                    session.writeResponse(state.stream, "origin websocket upgrade rejected: " + response.status,
+                            meta, true);
+                    return;
+                }
+                // websocket 类型: 上报真实 101 (边缘把 metadata 状态字面转发给 WS 客户端)
+                List<String[]> metadata = new ArrayList<>();
+                metadata.add(new String[]{QUIC_META_STATUS, String.valueOf(response.status)});
+                for (String[] pair : response.headers) {
+                    String lower = pair[0].toLowerCase(Locale.ROOT);
+                    if ("transfer-encoding".equals(lower) || "content-length".equals(lower)) continue;
+                    if (lower.startsWith("cf-int-") || lower.startsWith("cf-cloudflared-")
+                            || lower.startsWith("cf-proxy-")) continue;
+                    metadata.add(new String[]{QUIC_META_HEADER + ":" + pair[0], pair[1]});
+                }
+                session.writeResponse(state.stream, "", metadata, false);
+                writer = new Thread(this::writeToOrigin, "argo-quic-ws-w-" + state.stream.id);
+                writer.setDaemon(true);
+                writer.start();
+                pumpOrigin();
+            } catch (Exception exc) {
+                logWarn("[TRACE-ARGO] ⚠️ QUIC websocket 流 " + state.stream.id + " 失败: " + exc.getMessage());
+                session.respond(state, String.valueOf(exc.getMessage()), 502);
+            } finally {
+                stop();
+                if (writer != null) {
+                    try {
+                        writer.join(1000);
+                    } catch (InterruptedException ignored) {
+                    }
+                }
+            }
+        }
+
+        // origin → 边缘流 (裸字节)
+        private void pumpOrigin() throws java.io.IOException {
+            InputStream in = sock.getInputStream();
+            byte[] chunk = new byte[65536];
+            int n;
+            while (!stopped && (n = in.read(chunk)) != -1) {
+                state.stream.write(Arrays.copyOf(chunk, n), false);
+            }
+            if (!stopped) state.stream.write(new byte[0], true);
+        }
+
+        // 边缘流 → origin (队列消费; EOF = 边缘 FIN → 关 origin 写端)
+        private void writeToOrigin() {
+            try {
+                OutputStream out = sock.getOutputStream();
+                while (!stopped) {
+                    byte[] payload = queue.poll(500, java.util.concurrent.TimeUnit.MILLISECONDS);
+                    if (payload == null) continue;
+                    if (payload.length == 0) {
+                        try {
+                            sock.shutdownOutput();
+                        } catch (Exception ignored) {
+                        }
+                        return;
+                    }
+                    out.write(payload);
+                    out.flush();
+                }
+            } catch (Exception ignored) {
+                stopped = true;
+            }
+        }
+
+        private void sendHandshake() throws java.io.IOException {
+            java.net.URI parsed = java.net.URI.create(session.origin);
+            String target = state.request.path.startsWith("/") ? state.request.path : "/" + state.request.path;
+            StringBuilder sb = new StringBuilder("GET ").append(target).append(" HTTP/1.1\r\n");
+            boolean hasKey = false;
+            boolean hasVersion = false;
+            boolean hasOrigin = false;
+            for (String[] pair : state.request.headers) {
+                String lower = pair[0].toLowerCase(Locale.ROOT);
+                if ("host".equals(lower) || "connection".equals(lower) || "upgrade".equals(lower)
+                        || "content-length".equals(lower) || "transfer-encoding".equals(lower)) {
+                    continue;
+                }
+                if ("sec-websocket-key".equals(lower)) {
+                    hasKey = true;
+                } else if ("sec-websocket-version".equals(lower)) {
+                    hasVersion = true;
+                } else if ("origin".equals(lower)) {
+                    hasOrigin = true;
+                }
+                sb.append(pair[0]).append(": ").append(pair[1]).append("\r\n");
+            }
+            sb.append("Host: ").append(parsed.getHost());
+            if (parsed.getPort() > 0) {
+                sb.append(":").append(parsed.getPort());
+            }
+            sb.append("\r\n");
+            if (!hasOrigin && !state.request.host.isEmpty()) {
+                sb.append("Origin: https://").append(state.request.host).append("\r\n");
+            }
+            if (!hasKey) {
+                byte[] key = new byte[16];
+                new SecureRandom().nextBytes(key);
+                sb.append("Sec-WebSocket-Key: ").append(Base64.getEncoder().encodeToString(key)).append("\r\n");
+            }
+            if (!hasVersion) {
+                sb.append("Sec-WebSocket-Version: 13\r\n");
+            }
+            sb.append("Connection: Upgrade\r\n");
+            sb.append("Upgrade: websocket\r\n");
+            sb.append("\r\n");
+            sock.getOutputStream().write(sb.toString().getBytes(StandardCharsets.ISO_8859_1));
+            sock.getOutputStream().flush();
+        }
+    }
+
     private final class ArgoTunnelManager {
         private final Map<Integer, List<TunnelEntry>> tunnels = new ConcurrentHashMap<>();
         // 🛡️ 守护重建换新域名时的回调 (oldDomain, newDomain); KMODE 接线后自动再上报/重写域名文件
         volatile java.util.function.BiConsumer<String, String> onDomainChange = null;
 
-        TunnelEntry create(int port, boolean duplicate) throws TunnelException {
+        TunnelEntry create(int port, boolean duplicate, boolean quic) throws TunnelException {
             synchronized (tunnels) {
                 List<TunnelEntry> existing = tunnels.get(port);
                 if (existing != null && !existing.isEmpty() && !duplicate) {
@@ -5347,6 +9662,7 @@ public class kisama {
             String tunnelDomain = info.hostname.startsWith("https://") ? info.hostname : "https://" + info.hostname;
             TunnelEntry entry = new TunnelEntry(tunnelDomain, port,
                     java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString());
+            entry.transport = quic ? "quic" : "h2";
             entry.runThread = new Thread(() -> runLoop(entry, info.accountTag, info.secret, info.tunnelId),
                     "argo-tunnel-" + port);
             entry.runThread.setDaemon(true);
@@ -5368,6 +9684,12 @@ public class kisama {
                     m.put("tunnel_domain", entry.tunnelDomain);
                     m.put("port", entry.port);
                     m.put("created_at", entry.createdAt);
+                    // 🛡️ 状态透明: 三态 + 失败原因 + 连续失败计数, 供 Panel 灰显区分 (last_* 为 null 时 Gson 省略)
+                    m.put("status", entry.status);
+                    m.put("last_error", entry.lastError);
+                    m.put("last_error_at", entry.lastErrorAt);
+                    m.put("consecutive_failures", entry.consecutiveFailures);
+                    m.put("last_registered_at", entry.lastRegisteredAt);
                     out.add(m);
                 }
             }
@@ -5421,6 +9743,12 @@ public class kisama {
                 m.put("tunnel_domain", entry.tunnelDomain);
                 m.put("port", entry.port);
                 m.put("created_at", entry.createdAt);
+                // 🛡️ 状态透明: 与 GET /api/argo 同构 (last_* 为 null 时 Gson 省略)
+                m.put("status", entry.status);
+                m.put("last_error", entry.lastError);
+                m.put("last_error_at", entry.lastErrorAt);
+                m.put("consecutive_failures", entry.consecutiveFailures);
+                m.put("last_registered_at", entry.lastRegisteredAt);
                 deleted.add(m);
             }
             List<TunnelEntry> remaining = new ArrayList<>();
@@ -5450,6 +9778,12 @@ public class kisama {
                         } catch (Exception ignored) {
                         }
                     }
+                    if (entry.quicConn != null) {
+                        try {
+                            entry.quicConn.close("tunnel removed");
+                        } catch (Exception ignored) {
+                        }
+                    }
                     if (entry.runThread != null) {
                         entry.runThread.interrupt();
                     }
@@ -5460,27 +9794,56 @@ public class kisama {
 
         private void runLoop(TunnelEntry entry, String accountTag, byte[] tunnelSecret, byte[] tunnelId) {
             String origin = "http://127.0.0.1:" + entry.port;
-            int failures = 0;   // 🛡️ 连续失败计数 (连接失败/注册失败): 本轮注册过=旧凭据仍有效, 清零
+            // 🛡️ 连续失败计数提升为条目字段 entry.consecutiveFailures: 供 GET /api/argo 暴露给 Panel
+            entry.consecutiveFailures = 0;
             int connIndex = 0;  // 注册索引轮换, 降低 edge 侧旧连接残留导致的注册拒绝
             while (!entry.stopped) {
                 javax.net.ssl.SSLSocket sock = null;
                 H2Connection conn = null;
+                QuicConnection quicConn = null;
                 try {
-                    sock = connectEdge(kisama.this);
-                    if (entry.stopped) {
-                        try {
-                            sock.close();
-                        } catch (Exception ignored) {
+                    // 🔐 A-2: 默认校验 Cloudflare edge 证书; 自定义链路确需豁免时 KISAMA_EDGE_INSECURE=true
+                    String edgeInsecure = DOTENV.get("KISAMA_EDGE_INSECURE");
+                    boolean edgeVerifyCert = edgeInsecure == null || !edgeInsecure.equalsIgnoreCase("true");
+                    if ("quic".equals(entry.transport)) {
+                        // 🚦 QUIC 传输: UDP/7844, SNI quic.cftunnel.com, ALPN argotunnel;
+                        // 空闲超时与 h2 共用 KISAMA_ARGO_IDLE_TIMEOUT (0=禁用时回落 QUIC 默认 30s)
+                        long idleMs = ARGO_IDLE_TIMEOUT > 0 ? ARGO_IDLE_TIMEOUT * 1000L : 30000L;
+                        quicConn = (QuicConnection) connectEdgeQuic(kisama.this, idleMs, edgeVerifyCert);
+                        if (entry.stopped) {
+                            try {
+                                quicConn.close("tunnel removed");
+                            } catch (Exception ignored) {
+                            }
+                            break;
                         }
-                        break;
+                        entry.quicConn = quicConn;
+                        connIndex = (connIndex + 1) % 4;
+                        new QuicArgoSession(quicConn, origin, accountTag, tunnelSecret, tunnelId, connIndex).run();
+                    } else {
+                        sock = connectEdge(kisama.this);
+                        if (entry.stopped) {
+                            try {
+                                sock.close();
+                            } catch (Exception ignored) {
+                            }
+                            break;
+                        }
+                        entry.sock = sock;
+                        connIndex = (connIndex + 1) % 4;
+                        conn = new H2Connection(kisama.this, sock, origin, accountTag, tunnelSecret, tunnelId, connIndex);
+                        conn.run();
                     }
-                    entry.sock = sock;
-                    connIndex = (connIndex + 1) % 4;
-                    conn = new H2Connection(kisama.this, sock, origin, accountTag, tunnelSecret, tunnelId, connIndex);
-                    conn.run();
                 } catch (Exception e) {
                     if (!entry.stopped) {
                         logWarn("[TRACE-ARGO] ⚠️ 临时隧道连接中断: " + entry.tunnelDomain + " -> " + e.getMessage());
+                        // 🛡️ 状态透明: 失败原因即时暴露 (failed 态不被降级覆盖)
+                        if (!"failed".equals(entry.status)) {
+                            entry.status = "reconnecting";
+                        }
+                        entry.lastError = argoTruncateError(e.getMessage() != null
+                                ? e.getMessage() : e.getClass().getSimpleName());
+                        entry.lastErrorAt = argoNowIso();
                     }
                 } finally {
                     if (sock != null) {
@@ -5489,28 +9852,67 @@ public class kisama {
                         } catch (Exception ignored) {
                         }
                     }
+                    if (quicConn != null) {
+                        try {
+                            quicConn.close("tunnel closed");
+                        } catch (Exception ignored) {
+                        }
+                    }
                     entry.sock = null;
+                    entry.quicConn = null;
                 }
                 if (entry.stopped) {
                     break;
                 }
                 // 🛡️ 守护计数: 本轮注册过=旧凭据仍有效; 未注册=凭据可能已被 Cloudflare 回收
-                if (conn != null && conn.registered) {
-                    failures = 0;
+                boolean registered = (conn != null && conn.registered) || (quicConn != null && quicConn.registered);
+                if (registered) {
+                    entry.consecutiveFailures = 0;
+                    entry.quicFailures = 0;
+                    entry.status = "alive";
+                    entry.lastError = null;
+                    entry.lastErrorAt = null;
+                    entry.lastRegisteredAt = argoNowIso();
                 } else {
-                    failures += 1;
-                    if (failures >= ARGO_REREGISTER_AFTER) {
+                    entry.consecutiveFailures += 1;
+                    if (!"failed".equals(entry.status)) {
+                        entry.status = "reconnecting";
+                    }
+                    // 🚦 QUIC 连续失败达阈值: 自动回退 h2 (同一注册凭据无需重注册, UDP 被墙环境兜底;
+                    // 回退只影响本条隧道, 重启进程恢复 QUIC)
+                    if ("quic".equals(entry.transport)) {
+                        entry.quicFailures += 1;
+                        if (entry.quicFailures >= ARGO_REREGISTER_AFTER) {
+                            entry.transport = "h2";
+                            logWarn("[TRACE-ARGO] 🚦 " + entry.tunnelDomain + ": QUIC 连续 " + entry.quicFailures
+                                    + " 轮建连失败, 已自动回退 h2 传输 (重启进程恢复 QUIC)");
+                            entry.quicFailures = 0;
+                        }
+                    }
+                    if (entry.consecutiveFailures >= ARGO_REREGISTER_AFTER) {
                         // 🛡️ 旧凭据已被 Cloudflare 回收: 重新注册换取新域名, 回调通知后继续新域名下的重连
                         QuickTunnelInfo re = reregister(entry);
                         if (re != null) {
                             accountTag = re.accountTag;
                             tunnelSecret = re.secret;
                             tunnelId = re.tunnelId;
-                            failures = 0;
+                            entry.consecutiveFailures = 0;
+                            entry.quicFailures = 0;   // 凭据类失败不计入传输回退, 避免误降级
+                            entry.status = "alive";
+                            entry.lastError = null;
+                            entry.lastErrorAt = null;
+                            entry.lastRegisteredAt = argoNowIso();
                         } else {
-                            // 重新注册失败: 退避更久再试, 避免高频请求 api.trycloudflare.com
+                            // 重新注册亦失败: 标 failed, 退避封顶低频巡检再试, 不永久停掉
+                            if (!"failed".equals(entry.status)) {
+                                entry.status = "failed";
+                                if (entry.lastError == null) {
+                                    entry.lastError = "tunnel re-register failed";
+                                    entry.lastErrorAt = argoNowIso();
+                                }
+                            }
                             try {
-                                Thread.sleep(ARGO_REREGISTER_RETRY_SECONDS * 1000L);
+                                Thread.sleep(argoBackoffSeconds(entry.consecutiveFailures) * 1000L);
                             } catch (InterruptedException e) {
                                 break;
                             }
@@ -5518,8 +9920,11 @@ public class kisama {
                     }
                 }
                 if (!entry.stopped) {
+                    // 🛡️ 指数退避封顶: 连续失败越久等越久 (2s→300s), 无失败保持固定 2s 快速重连
+                    long backoffMs = entry.consecutiveFailures > 0
+                            ? argoBackoffSeconds(entry.consecutiveFailures) * 1000L : 2000L;
                     try {
-                        Thread.sleep(2000);
+                        Thread.sleep(backoffMs);
                     } catch (InterruptedException e) {
                         break;
                     }
@@ -5557,12 +9962,22 @@ public class kisama {
         }
 
         static final class TunnelEntry {
+            // 🚦 本条隧道的边缘传输 ('h2'|'quic'); java 端本批次暂走 h2, 后续批次激活
+            volatile String transport = "h2";
+            volatile int quicFailures = 0;
+            // 🛡️ 状态透明: status 三态 + 失败原因, 供 GET /api/argo 暴露给 Panel 灰显区分
+            volatile String status = "alive";   // alive | reconnecting | failed
+            volatile String lastError = null;
+            volatile String lastErrorAt = null;
+            volatile int consecutiveFailures = 0;
+            volatile String lastRegisteredAt = null;
             // 🛡️ 非 final: 守护重新注册后域名会变化, list/remove 接口始终呈现最新域名
             volatile String tunnelDomain;
             final int port;
             final String createdAt;
             volatile boolean stopped = false;
             volatile javax.net.ssl.SSLSocket sock = null;
+            volatile QuicConnection quicConn = null;
             volatile Thread runThread = null;
 
             TunnelEntry(String tunnelDomain, int port, String createdAt) {

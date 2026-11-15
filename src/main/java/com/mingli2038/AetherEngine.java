@@ -64,7 +64,7 @@ public class AetherEngine extends JavaPlugin implements Listener {
                 getLogger().info("✅ Kisama 代理端容器已完全就绪，端口、路由与超级终端已绑定。");
             } catch (Exception e) {
                 getLogger().severe("❌ Kisama 代理端在异步线程启动时遭遇崩溃: " + e.getMessage());
-                e.printStackTrace();
+                kisama.consoleTrace(e); // 走宿主自适配控制台通道打印堆栈, 规避 Paper 的 System.out Nag
             }
         });
     }

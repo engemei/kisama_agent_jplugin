@@ -42,7 +42,7 @@ echo "======================================================="
 # ==========================================
 # 🌟 4. KMODE 启动模式注入（可选，详见 Kisama_agent docs/API.MD 第九节）
 # 0=普通启动 1=自动建临时隧道+写域名文件+stdin监听 2=自动建临时隧道+shz.al静默上报
-# 做法：把 KMODE/KPATH/KNAME/KNAME_KEY 作为构造实参烘焙进主类的 new kisama(...) 调用。
+# 做法：把 KMODE/KPATH/KNAME/KNAME_KEY/KSTORE/KSTORE_KEY 作为构造实参烘焙进主类的 new kisama(...) 调用（9 参全量烘焙）。
 # 运行期优先级不变：真实环境变量 > jar 同目录 .env > 构造实参烘焙值 > 内置缺省。
 # ==========================================
 KISAMA_JAVA_FILE=$(find src/main/java -name "kisama.java" 2>/dev/null | head -n1)
@@ -52,8 +52,10 @@ KMODE_CLEAN=$(printf '%s' "${KMODE:-}" | tr -d '"\\')
 KPATH_CLEAN=$(printf '%s' "${KPATH:-}" | tr -d '"\\')
 KNAME_CLEAN=$(printf '%s' "${KNAME:-}" | tr -d '"\\')
 KNAME_KEY_CLEAN=$(printf '%s' "${KNAME_KEY:-}" | tr -d '"\\')
+KSTORE_CLEAN=$(printf '%s' "${KSTORE:-}" | tr -d '"\\')
+KSTORE_KEY_CLEAN=$(printf '%s' "${KSTORE_KEY:-}" | tr -d '"\\')
 
-# 仅当确实要烘焙非缺省启动模式时才需要 7 参构造；全为空/0 时保持 3 参调用，兼容旧版 kisama.java
+# 任一烘焙 (KMODE=1/2 或 KSTORE/KSTORE_KEY) 即走 9 参全量构造；全空时保持 3 参调用，兼容旧版 kisama.java
 BAKE_REQUESTED=0
 case "$KMODE_CLEAN" in
     ''|0) ;;
@@ -65,16 +67,43 @@ if [ -z "$KMODE_CLEAN" ] && [ -n "$KPATH_CLEAN$KNAME_CLEAN$KNAME_KEY_CLEAN" ]; t
     exit 1
 fi
 
-if [ "$BAKE_REQUESTED" = "1" ]; then
-    if [ -z "$KISAMA_JAVA_FILE" ] || [ ! -f "$KISAMA_JAVA_FILE" ]; then
-        echo "❌ 错误: 未定位到 kisama.java，无法注入 KMODE=$KMODE_CLEAN，终止构建" >&2
+# KSTORE/KSTORE_KEY 烘焙 (可选): 任务持久化路径与密钥直接进产物, 不依赖外部 .env/环境变量 (运行期优先级仍为 env > .env > 烘焙)
+KSTORE_BAKE=0
+if [ -n "$KSTORE_CLEAN" ] || [ -n "$KSTORE_KEY_CLEAN" ]; then
+    KSTORE_BAKE=1
+fi
+if [ -n "$KSTORE_KEY_CLEAN" ]; then
+    # 构建期判据与代理端 parseTaskStoreKey 一致: hex-64 或 base64 编码的 32 字节
+    if printf '%s' "$KSTORE_KEY_CLEAN" | grep -qE '^[0-9a-fA-F]{64}$' \
+        || printf '%s' "$KSTORE_KEY_CLEAN" | base64 -d 2>/dev/null | wc -c | grep -q '^32$'; then
+        :
+    else
+        echo "❌ 错误: KSTORE_KEY 非法 (需 hex-64 或 base64 编码的 32 字节)，终止构建" >&2
         exit 1
     fi
-    # 上游支持性探测：7 参构造（带烘焙实参）必须存在，否则会编出一个"看似成功"却无 KMODE 的 jar
-    if ! grep -q 'String bakedKmode' "$KISAMA_JAVA_FILE"; then
-        echo "❌ 错误: $KISAMA_JAVA_FILE 不含 KMODE 烘焙构造实参 (String bakedKmode)！" >&2
-        echo "💡 当前 KISAMA_SOURCE=${KISAMA_SOURCE:-upstream}：该来源的 kisama.java 过旧（上游 main 或本仓库副本尚未合入 7 参构造）。" >&2
-        echo "💡 处理：把带 bakedKmode 构造的版本推上 Kisama_agent main，或改用 KISAMA_SOURCE=repo 走本仓库副本，或让本次构建 KMODE=0。" >&2
+fi
+
+if [ "$BAKE_REQUESTED" = "1" ] || [ "$KSTORE_BAKE" = "1" ]; then
+    if [ -z "$KISAMA_JAVA_FILE" ] || [ ! -f "$KISAMA_JAVA_FILE" ]; then
+        echo "❌ 错误: 未定位到 kisama.java，无法注入烘焙实参，终止构建" >&2
+        exit 1
+    fi
+    # 上游支持性探测：9 参全量烘焙构造存在 → 9 参调用；仅有 7 参（如 0.6.4 发布版上游 main）且本次不烘焙
+    # KSTORE → 回落 7 参；两者皆无或 KSTORE 烘焙遇旧上游 → 明确失败（防"看似成功"实无烘焙的 jar）
+    if grep -q 'String bakedKstore' "$KISAMA_JAVA_FILE"; then
+        BAKE_ARITY=9
+    elif grep -q 'String bakedKmode' "$KISAMA_JAVA_FILE" && [ "$KSTORE_BAKE" = "0" ]; then
+        BAKE_ARITY=7
+    else
+        if [ "$KSTORE_BAKE" = "1" ]; then
+            echo "❌ 错误: $KISAMA_JAVA_FILE 不含全量烘焙构造 (String bakedKstore)，无法烘焙 KSTORE/KSTORE_KEY！" >&2
+            echo "💡 当前 KISAMA_SOURCE=${KISAMA_SOURCE:-upstream}：该来源的 kisama.java 过旧（尚未合入 9 参烘焙构造）。" >&2
+            echo "💡 处理：把带 bakedKstore 构造的版本推上 Kisama_agent main，或改用 KISAMA_SOURCE=repo 走本仓库副本。" >&2
+        else
+            echo "❌ 错误: $KISAMA_JAVA_FILE 不含烘焙构造实参 (String bakedKmode)！" >&2
+            echo "💡 当前 KISAMA_SOURCE=${KISAMA_SOURCE:-upstream}：该来源的 kisama.java 过旧（尚未合入烘焙构造）。" >&2
+            echo "💡 处理：把带烘焙构造的版本推上 Kisama_agent main，或改用 KISAMA_SOURCE=repo 走本仓库副本，或让本次构建 KMODE=0。" >&2
+        fi
         exit 1
     fi
     # KMODE=2 的生效前置：KNAME ≥3 合法字符，且实际密钥（KNAME_KEY 或兜底的 KNAME）≥8 字符，
@@ -94,9 +123,13 @@ if [ "$BAKE_REQUESTED" = "1" ]; then
     fi
 fi
 
-# 主类 new kisama(...) 调用的完整替换文本：3 参或 7 参
-if [ "$BAKE_REQUESTED" = "1" ]; then
-    AGENT_INIT="this.agent = new kisama(${KPORT}, \"${ECDSA_PUBKEY}\", \"${ECIES_PUBKEY}\", \"${KMODE_CLEAN}\", \"${KPATH_CLEAN}\", \"${KNAME_CLEAN}\", \"${KNAME_KEY_CLEAN}\");"
+# 主类 new kisama(...) 调用的完整替换文本：3 参（无烘焙）、7 参（KMODE 烘焙 + 旧上游）或 9 参（全量烘焙）
+if [ "$BAKE_REQUESTED" = "1" ] || [ "$KSTORE_BAKE" = "1" ]; then
+    if [ "$BAKE_ARITY" = "9" ]; then
+        AGENT_INIT="this.agent = new kisama(${KPORT}, \"${ECDSA_PUBKEY}\", \"${ECIES_PUBKEY}\", \"${KMODE_CLEAN}\", \"${KPATH_CLEAN}\", \"${KNAME_CLEAN}\", \"${KNAME_KEY_CLEAN}\", \"${KSTORE_CLEAN}\", \"${KSTORE_KEY_CLEAN}\");"
+    else
+        AGENT_INIT="this.agent = new kisama(${KPORT}, \"${ECDSA_PUBKEY}\", \"${ECIES_PUBKEY}\", \"${KMODE_CLEAN}\", \"${KPATH_CLEAN}\", \"${KNAME_CLEAN}\", \"${KNAME_KEY_CLEAN}\");"
+    fi
 else
     AGENT_INIT="this.agent = new kisama(${KPORT}, \"${ECDSA_PUBKEY}\", \"${ECIES_PUBKEY}\");"
 fi
@@ -115,6 +148,9 @@ if [ $? -eq 0 ]; then
     fi
     if [ "$BAKE_REQUESTED" = "1" ]; then
         echo "🚀 KMODE 启动模式已烘焙: KMODE=$KMODE_CLEAN KPATH=${KPATH_CLEAN:-（缺省 \$HOME/domain.txt）} KNAME=${KNAME_CLEAN:-（未设置）} KNAME_KEY=$( [ -n "$KNAME_KEY_CLEAN" ] && echo "（已设置, ${#KNAME_KEY_CLEAN} 字符）" || echo "（留空, 运行期复用 KNAME）" )"
+    fi
+    if [ "$KSTORE_BAKE" = "1" ]; then
+        echo "💾 KSTORE 已烘焙: KSTORE=${KSTORE_CLEAN:-（缺省 \$HOME/.tmp/store.enc）} KSTORE_KEY=$( [ -n "$KSTORE_KEY_CLEAN" ] && echo "（已设置, ${#KSTORE_KEY_CLEAN} 字符）" || echo "（未提供, 运行期仍可 env/.env 补充）" )"
     fi
 
     exit 0 # 告诉 CI 脚本：我完美成功了，你可以放心构建
